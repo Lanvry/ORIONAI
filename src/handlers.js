@@ -12,11 +12,17 @@ const {
   getMimeType,
   escapeMd,
 } = require('./utils');
+const { saveCredentials, getCredentials, deleteCredentials, hasCredentials } = require('./etholCredentials');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+
+// In-memory state untuk alur setup multi-step /ethollogin
+// key: userId (string), value: { step: 'email'|'password', email?: string }
+const pendingEtholSetup = new Map();
+
 
 // ─── Safe Edit Message (ignore "not modified" error, log sisanya) ─────────────
 async function safeEdit(ctx, msgId, text, opts) {
@@ -353,8 +359,18 @@ const mainMenuKeyboard = {
     keyboard: [
       [{ text: '\uD83D\uDCCB Daftar Tugas' }, { text: '\uD83D\uDD17 Login Google' }],
       [{ text: '\u2705 Kumpulkan Tugas' }, { text: '\uD83E\uDD16 Tanya AI' }],
-      [{ text: '\uD83D\uDCDA Daftar Mapel' }, { text: '\u2753 Bantuan' }]
+      [{ text: '\uD83D\uDCDA Daftar Mapel' }, { text: '\uD83C\uDF93 Absen ETHOL' }],
+      [{ text: '\u2753 Bantuan' }, { text: '\u274C Tutup Menu' }]
     ],
+    resize_keyboard: true,
+    is_persistent: false
+  }
+};
+
+// Keyboard minimal hanya tombol buka menu
+const openMenuKeyboard = {
+  reply_markup: {
+    keyboard: [[{ text: '\uD83D\uDCCB Buka Menu' }]],
     resize_keyboard: true,
     is_persistent: true
   }
@@ -370,7 +386,7 @@ function register(bot) {
     await ctx.reply(
       '\uD83D\uDC4B Halo, *' + name + '*! Saya *Orion* \u2014 asisten AI akademis pribadimu.\n\n' +
       '\uD83D\uDCCC *ID Telegram kamu:* `' + ownerId + '`\n' +
-      '(Salin ID ini ke file .env pada variabel `TELEGRAM_OWNER_ID`)\n\n' +
+      '\n\n' +
       '\u2728 Aku bisa:\n' +
       '\u2022 Cek & notifikasi tugas Classroom\n' +
       '\u2022 Kumpulkan tugas langsung dari Telegram\n' +
@@ -392,7 +408,8 @@ function register(bot) {
       '\uD83D\uDD17 Login Google - Hubungkan akun Google untuk akses Classroom\n' +
       '\u2705 Kumpulkan Tugas - Upload file langsung dari Telegram ke Classroom\n' +
       '\uD83E\uDD16 Tanya AI - Ngobrol atau tanya apa saja ke AI\n' +
-      '\uD83D\uDCDA Daftar Mapel - Lihat semua mata kuliah aktif\n\n' +
+      '\uD83D\uDCDA Daftar Mapel - Lihat semua mata kuliah aktif\n' +
+      '\uD83C\uDF93 Absen ETHOL - Otomatis eksekusi absen di ETHOL PENS (dianalisa AI)\n\n' +
       'Perintah khusus:\n' +
       '/detail <nomor> - Detail lengkap tugas\n' +
       '/ringkas <nomor> - AI ringkaskan tugas untuk kamu\n' +
@@ -401,8 +418,85 @@ function register(bot) {
       '1. Tekan tombol Kumpulkan Tugas\n' +
       '2. Pilih tugas dari daftar\n' +
       '3. Kirim file-nya ke sini\n' +
-      '4. Bot akan otomatis upload & kumpulkan ke Classroom'
+      '4. Bot akan otomatis upload & kumpulkan ke Classroom\n\n' +
+      '🔐 Perintah ETHOL:\n' +
+      '/ethollogin - Setup kredensial ETHOL Anda (aman & terenkripsi)\n' +
+      '/ethollogout - Hapus kredensial ETHOL Anda'
     );
+  });
+
+  // ─── ETHOL Login Setup ─────────────────────────────────────────────────────
+  bot.command('ethollogin', async (ctx) => {
+    const userId = String(ctx.from.id);
+    if (hasCredentials(userId)) {
+      pendingEtholSetup.set(userId, { step: 'confirm_overwrite' });
+      return ctx.reply(
+        '⚠️ Anda sudah punya kredensial ETHOL yang tersimpan.\n\nKirim *ya* untuk menggantinya, atau *batal* untuk membatalkan.',
+        { parse_mode: 'Markdown' }
+      );
+    }
+    pendingEtholSetup.set(userId, { step: 'email' });
+    await ctx.reply('🔐 *Setup ETHOL Login*\n\nLangkah 1/2: Kirim *email* ETHOL Anda:\n_(Contoh: 123456@student.pens.ac.id)_', { parse_mode: 'Markdown' });
+  });
+
+  bot.command('ethollogout', async (ctx) => {
+    const userId = String(ctx.from.id);
+    const deleted = deleteCredentials(userId);
+    if (deleted) {
+      await ctx.reply('✅ Kredensial ETHOL Anda telah dihapus dari sistem.');
+    } else {
+      await ctx.reply('ℹ️ Tidak ada kredensial ETHOL yang tersimpan untuk akun Anda.');
+    }
+  });
+
+  // ─── Handler pesan multi-step untuk /ethollogin ────────────────────────────
+  bot.on('text', async (ctx, next) => {
+    const userId = String(ctx.from.id);
+    const state = pendingEtholSetup.get(userId);
+    if (!state) return next(); // bukan sedang dalam alur setup, lanjutkan ke handler lain
+
+    const text = ctx.message.text.trim();
+
+    if (state.step === 'confirm_overwrite') {
+      if (text.toLowerCase() === 'ya') {
+        pendingEtholSetup.set(userId, { step: 'email' });
+        return ctx.reply('📧 Kirim *email* ETHOL baru Anda:', { parse_mode: 'Markdown' });
+      } else {
+        pendingEtholSetup.delete(userId);
+        return ctx.reply('❌ Dibatalkan. Kredensial lama tetap tersimpan.');
+      }
+    }
+
+    if (state.step === 'email') {
+      if (!text.includes('@')) {
+        return ctx.reply('⚠️ Format email tidak valid. Coba lagi:');
+      }
+      pendingEtholSetup.set(userId, { step: 'password', email: text });
+      return ctx.reply(
+        '🔑 Langkah 2/2: Kirim *password* ETHOL Anda:\n_(Pesan ini akan langsung dihapus setelah tersimpan)_',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    if (state.step === 'password') {
+      const { email } = state;
+      // Hapus pesan password user SESEGERA MUNGKIN
+      await ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+      try {
+        saveCredentials(userId, email, text);
+        pendingEtholSetup.delete(userId);
+        await ctx.reply(
+          '✅ *Kredensial ETHOL berhasil disimpan!*\n\n🔐 Email dan password Anda dienkripsi dengan AES-256 dan disimpan secara lokal.\n\nSekarang Anda bisa menggunakan 🎓 *Absen ETHOL*!',
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        pendingEtholSetup.delete(userId);
+        await ctx.reply('❌ Gagal menyimpan kredensial: ' + err.message);
+      }
+      return;
+    }
+
+    return next();
   });
 
   // /login atau tombol Login Google
@@ -445,6 +539,22 @@ function register(bot) {
     } catch (err) {
       await safeEdit(ctx, msg.message_id, 'Gagal refresh: ' + err.message);
     }
+  });
+
+  // ─── Tutup & Buka Menu ───────────────────────────────────────────────────────
+  bot.hears('❌ Tutup Menu', async (ctx) => {
+    await ctx.reply('Menu disembunyikan. Ketik *Buka Menu* atau /menu untuk membukanya kembali.', {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        keyboard: [[{ text: '📋 Buka Menu' }]],
+        resize_keyboard: true,
+        is_persistent: true
+      }
+    });
+  });
+
+  bot.hears(['📋 Buka Menu', '/menu'], async (ctx) => {
+    await ctx.reply('Menu dibuka kembali! 👋', mainMenuKeyboard);
   });
 
   // Daftar Tugas
@@ -509,6 +619,130 @@ function register(bot) {
         await safeEdit(ctx, loadingMsg.message_id, '\uD83D\uDCDD Ringkasan: *' + a.title + '*\n\n' + ringkasan, { parse_mode: 'Markdown' });
       } catch (err) {
         await safeEdit(ctx, loadingMsg.message_id, 'Error: ' + err.message);
+      }
+    })();
+  });
+
+  // ─── Absen ETHOL dengan Puppeteer + AI Vision ────────────────────────────────
+  bot.hears(['\uD83C\uDF93 Absen ETHOL', '/absen'], async function(ctx) {
+    const userId = String(ctx.from.id);
+    const creds = getCredentials(userId);
+
+    if (!creds) {
+      return ctx.reply(
+        '⚠️ Kredensial ETHOL Anda belum disimpan.\n\nGunakan perintah /ethollogin untuk menyimpan email dan password ETHOL Anda dengan aman.',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    const { email, password } = creds;
+
+    const chatId = ctx.chat.id;
+    const loadingMsg = await ctx.reply('🚀 Membuka portal akademik untuk memindai daftar absensi...');
+
+    (async () => {
+      try {
+        const { loginAndCheckEthol } = require('./etholService');
+        
+        const result = await loginAndCheckEthol(email, password, async (text) => {
+          await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
+        }, 'scan');
+
+        if (!result.success) {
+          return await safeEdit(ctx, loadingMsg.message_id, `❌ *Gagal Scraping:* ${result.error}`, { parse_mode: 'Markdown' });
+        }
+
+        if (result.courses && result.courses.length > 0) {
+          // Telegraf Inline Keyboard
+          const buttons = result.courses.map(c => [{ text: c, callback_data: `absen_exec_${c.substring(0, 40)}` }]);
+          
+          await safeEdit(ctx, loadingMsg.message_id, `✅ *Terdapat Mata Kuliah yang bisa di-absen!*\n\nSilakan klik salah satu mata kuliah di bawah untuk mengonfirmasi kehadiran Anda:`, { 
+             parse_mode: 'Markdown',
+             reply_markup: { inline_keyboard: buttons }
+          });
+        } else {
+           await ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+           if (result.screenshot) {
+             await ctx.replyWithPhoto(
+               { source: result.screenshot },
+               { caption: `✅ Pemindaian selesai. *Tidak ada jadwal presensi aktif* yang terdeteksi di dropdown notifikasi. Berikut adalah tangkapan layar lonceng notifikasi Anda.`, parse_mode: 'Markdown' }
+             );
+           } else {
+             await ctx.reply(`✅ Pemindaian selesai. *Tidak ada jadwal presensi aktif* yang terdeteksi di notifikasi Anda saat ini.`, { parse_mode: 'Markdown' });
+           }
+        }
+      } catch (err) {
+        await safeEdit(ctx, loadingMsg.message_id, 'Error Absen: ' + err.message);
+      }
+    })();
+  });
+
+  // Action Eksekusi Absen
+  bot.action(/^absen_exec_(.+)$/, async (ctx) => {
+    const targetCourse = ctx.match[1];
+    const chatId = ctx.chat.id;
+    
+    // Matikan tombol loading supaya tidak di-klik double
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+    await ctx.answerCbQuery('Menjalankan eksekusi...').catch(() => {});
+    
+    const userId = String(ctx.from.id);
+    const creds = getCredentials(userId);
+    if (!creds) {
+      return ctx.reply('⚠️ Kredensial ETHOL belum tersimpan. Gunakan /ethollogin terlebih dahulu.');
+    }
+    const { email, password } = creds;
+
+    const loadingMsg = await ctx.reply(`🚀 Mengeksekusi presensi untuk *${targetCourse}*...\n\n_Bot akan mengirim foto di setiap langkah._`, { parse_mode: 'Markdown' });
+
+
+    (async () => {
+      try {
+        const { loginAndCheckEthol } = require('./etholService');
+        
+        const result = await loginAndCheckEthol(
+          email, 
+          password, 
+          async (text) => {
+            await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
+          }, 
+          'execute', 
+          targetCourse,
+          async (screenshotBuffer, caption) => {
+            // Kirim foto langsung ke chat tanpa menghapus pesan loading
+            await ctx.replyWithPhoto({ source: screenshotBuffer }, { caption, parse_mode: 'Markdown' }).catch(() => {});
+          }
+        );
+
+        if (!result.success) {
+          return await safeEdit(ctx, loadingMsg.message_id, `❌ *Gagal Scraping:* ${result.error}`, { parse_mode: 'Markdown' });
+        }
+
+        // Tentukan pesan akhir berdasarkan status tombol
+        const isClosed = result.btnStatus && result.btnStatus.startsWith('CLOSED:');
+        const isClicked = result.btnStatus && !result.btnStatus.startsWith('CLOSED:');
+
+        await ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+        
+        if (isClicked) {
+          await ctx.replyWithPhoto(
+            { source: result.screenshot }, 
+            { caption: `✅ *Absensi Berhasil!*\nBukti kehadiran untuk *${targetCourse}* telah dikonfirmasi.`, parse_mode: 'Markdown' }
+          );
+        } else if (isClosed) {
+          await ctx.replyWithPhoto(
+            { source: result.screenshot }, 
+            { caption: `🔒 *Absensi Sudah Ditutup!*\nTombol presensi untuk *${targetCourse}* berwarna abu-abu. Dosen sudah menutup portal kehadiran.`, parse_mode: 'Markdown' }
+          );
+        } else {
+          await ctx.replyWithPhoto(
+            { source: result.screenshot }, 
+            { caption: `⚠️ *Tombol Presensi Tidak Ditemukan*\nLog: ${result.logs.slice(-2).join(', ')}`, parse_mode: 'Markdown' }
+          );
+        }
+
+      } catch (err) {
+        await safeEdit(ctx, loadingMsg.message_id, 'Error Eksekusi Absen: ' + err.message);
       }
     })();
   });

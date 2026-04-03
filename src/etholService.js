@@ -1,0 +1,276 @@
+const puppeteer = require('puppeteer');
+
+async function loginAndCheckEthol(email, password, onProgress, mode = 'scan', targetCourse = null, onScreenshot = null) {
+  if (onProgress) onProgress('Memulai eksekusi rahasia Puppeteer...');
+  
+  const browser = await puppeteer.launch({
+    headless: true, // Ubah ke false jika ingin melihat UI saat debugging di PC lokal
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800'],
+    defaultViewport: { width: 1280, height: 800 }
+  });
+  
+  const page = await browser.newPage();
+  const logs = [];
+
+  try {
+    if (onProgress) onProgress('🌐 Menuju portal login PENS (CAS)...');
+    await page.goto('https://login.pens.ac.id/cas/login?service=http%3A%2F%2Fethol.pens.ac.id%2Fcas%2F', { waitUntil: 'networkidle2', timeout: 20000 });
+
+    // Tunggu setidaknya ada satu input text/password muncul di halaman
+    logs.push('Menunggu form login CAS muncul...');
+    await page.waitForSelector('input[type="text"], input[type="email"], input:not([type="hidden"])', { timeout: 10000 }).catch(() => {
+      logs.push('Timeout tunggu form, coba lanjut...');
+    });
+
+    // Injeksi kredensial langsung via JavaScript (paling andal untuk semua framework)
+    if (onProgress) onProgress('🔐 Mengisi form login...');
+    await page.evaluate((emailVal, passVal) => {
+      // Cari field username/email — coba semua kemungkinan selector
+      const usernameSelectors = ['#username', '#netid', 'input[name="username"]', 'input[name="netid"]', 'input[type="text"]', 'input[type="email"]'];
+      const passwordSelectors = ['#password', 'input[name="password"]', 'input[type="password"]'];
+
+      let userField = null;
+      for (const sel of usernameSelectors) {
+        userField = document.querySelector(sel);
+        if (userField) break;
+      }
+
+      let passField = null;
+      for (const sel of passwordSelectors) {
+        passField = document.querySelector(sel);
+        if (passField) break;
+      }
+
+      if (userField) {
+        userField.focus();
+        userField.value = emailVal;
+        userField.dispatchEvent(new Event('input', { bubbles: true }));
+        userField.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      if (passField) {
+        passField.focus();
+        passField.value = passVal;
+        passField.dispatchEvent(new Event('input', { bubbles: true }));
+        passField.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, email, password);
+
+    await new Promise(r => setTimeout(r, 500));
+
+    // Klik tombol login secara eksplisit (lebih andal dari keyboard.press Enter)
+    const clicked = await page.evaluate(() => {
+      const submitSelectors = ['input[type="submit"]', 'button[type="submit"]', 'button.btn-submit', '#submitBtn', '.btn-login', 'button'];
+      for (const sel of submitSelectors) {
+        const btn = document.querySelector(sel);
+        if (btn) { btn.click(); return sel; }
+      }
+      return null;
+    });
+    logs.push(`Klik login button: ${clicked || 'fallback Enter'}`);
+    if (!clicked) await page.keyboard.press('Enter');
+
+    if (onProgress) onProgress('🔐 Sedang login, menunggu redirect ke ETHOL...');
+    // Tunggu redirect ke ethol
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {
+       logs.push('Timeout menunggu redirect ke ethol. Lanjut saja...');
+    });
+
+    if (onProgress) onProgress('📸 Membuka Dashboard ETHOL...');
+
+
+    // Heuristik: Mencoba mengikuti alur user
+    // 1. Pencet notifikasi
+    await page.evaluate(() => {
+      const bells = Array.from(document.querySelectorAll('.fa-bell, [class*="bell"], .dropdown-toggle'));
+      if (bells.length > 0) bells[0].click();
+    });
+    await new Promise(r => setTimeout(r, 1500));
+
+    // 1.5 Pilih filter "Presensi" di dropdown notifikasi
+    if (onProgress) onProgress('🔎 Mengganti filter notifikasi ke "Presensi"...');
+    
+    // Strategi Ganda (Native Select + Visual Klik)
+    await page.evaluate(() => {
+      // A. Coba paksa semua native <select> untuk pindah ke Presensi
+      const selects = Array.from(document.querySelectorAll('select'));
+      for (const s of selects) {
+        for (let i = 0; i < s.options.length; i++) {
+          if (s.options[i].text.toLowerCase().includes('presensi')) {
+            s.selectedIndex = i;
+            s.value = s.options[i].value;
+            s.dispatchEvent(new Event('change', { bubbles: true }));
+            s.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        }
+      }
+      
+      // B. Coba klik elemen UI (seperti div/span/button) yang bertuliskan "Tugas" / "Semua" 
+      // yang biasanya dipakai sebagai custom dropdown
+      const clickable = Array.from(document.querySelectorAll('div, span, button, a'));
+      for (const el of clickable) {
+        const txt = el.innerText ? el.innerText.trim().toLowerCase() : '';
+        // Jika el menampilkan "tugas" (filter default), coba klik agar list-nya terbuka
+        if (txt === 'tugas' || txt === 'semua pemberitahuan') {
+          el.click();
+        }
+      }
+    });
+
+    await new Promise(r => setTimeout(r, 1000)); // Beri waktu animasi dropdown terbuka (jika itu custom UI)
+
+    await page.evaluate(() => {
+      // C. Temukan dan klik opsi "Presensi" yang muncul di layar
+      const options = Array.from(document.querySelectorAll('div, span, button, a, li, option'));
+      for (const opt of options) {
+        const txt = opt.innerText ? opt.innerText.trim().toLowerCase() : '';
+        if (txt === 'presensi') {
+          opt.click();
+        }
+      }
+    });
+    
+    // Beri waktu jaringan (AJAX) memuat daftar kartu presensi
+    await new Promise(r => setTimeout(r, 2500));
+
+    // 2. Logika Berdasarkan Mode
+    if (mode === 'scan') {
+      if (onProgress) onProgress('🔎 Memindai daftar absensi yang tersedia...');
+      const availableCourses = await page.evaluate(() => {
+        const listItems = Array.from(document.querySelectorAll('a, li, tr, [class*="item"], div'));
+        const found = [];
+        for (const item of listItems) {
+          const text = item.innerText ? item.innerText.toLowerCase() : '';
+          if (text.includes('dosen telah melakukan presensi')) {
+            const matchIndex = text.indexOf('matakuliah ');
+            let mapel = text;
+            if (matchIndex !== -1) {
+              mapel = text.substring(matchIndex + 'matakuliah '.length).trim();
+              mapel = mapel.split(/\r?\n/)[0].trim();
+            }
+            if (mapel && !found.includes(mapel) && mapel.length < 50) {
+              found.push(mapel);
+            }
+          }
+        }
+        return found;
+      });
+      
+      let scanBuffer = null;
+      if (availableCourses.length === 0) {
+        if (onProgress) onProgress('📸 Mengambil bukti layar karena daftar kosong...');
+        scanBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
+      }
+
+      await browser.close();
+      return { success: true, mode: 'scan', courses: availableCourses, screenshot: scanBuffer };
+    }
+
+    // --- Mode Execute ---
+    if (mode === 'execute') {
+      if (onProgress) onProgress(`🗺️ Langkah 1: Mencari notifikasi mapel "${targetCourse || 'Teratas'}"...`);
+      
+      // Cari div.hover-notifikasi yang tepat berisi teks nama mapel tujuan
+      const foundTarget = await page.evaluate((target) => {
+        // Selector persis sesuai DevTools: div dengan class "hover-notifikasi"
+        const cards = Array.from(document.querySelectorAll('div[class*="hover-notifikasi"]'));
+        for (const card of cards) {
+          const text = card.innerText ? card.innerText.toLowerCase() : '';
+          const matchPresensi = text.includes('dosen telah melakukan presensi');
+          const matchTarget = target ? text.includes(target.toLowerCase()) : true;
+          if (matchPresensi && matchTarget) {
+            card.click();
+            return true;
+          }
+        }
+        return false;
+      }, targetCourse);
+
+      // Tunggu navigasi ke halaman detail notifikasi
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
+      await new Promise(r => setTimeout(r, 1000));
+      
+      // Screenshot setelah navigasi ke halaman detail (harus tampil card + Akses Kuliah)
+      const ss1 = await page.screenshot({ type: 'jpeg', quality: 75 });
+      if (onScreenshot) await onScreenshot(ss1, foundTarget 
+        ? `📸 Langkah 1: Halaman detail notifikasi "${targetCourse}":`
+        : `⚠️ Notifikasi "${targetCourse}" tidak ditemukan — halaman saat ini:`
+      );
+
+      if (!foundTarget) {
+        logs.push(`Gagal menemukan notifikasi untuk: ${targetCourse || 'Teratas'}`);
+      }
+    }
+
+    // Langkah 2: Klik "Akses Kuliah" di halaman detail yang sudah terbuka
+    if (onProgress) onProgress('🗺️ Langkah 2: Mengeklik tombol Akses Kuliah...');
+    await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a, button'));
+      for (const link of links) {
+        if (link.innerText && link.innerText.toLowerCase().includes('akses kuliah')) {
+          link.click();
+          break;
+        }
+      }
+    });
+    // Tunggu halaman kelas terbuka
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
+
+    // Screenshot setelah klik Akses Kuliah
+    const ss2 = await page.screenshot({ type: 'jpeg', quality: 75 });
+    if (onScreenshot) await onScreenshot(ss2, `📸 Setelah klik "Akses Kuliah" — halaman kelas:`);
+
+    // 4. Klik tombol Presensi jika belum abu-abu
+    if (onProgress) onProgress('🗺️ Langkah 3: Mencari tombol Presensi...');
+    const clickedBtnText = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, a'));
+      for (const btn of buttons) {
+        const text = (btn.innerText || '').toLowerCase();
+        if (text === 'presensi' || text.includes('absen') || text.includes('hadir')) {
+          // Abaikan jika "abu-abu" (disabled class or attr)
+          if (!btn.disabled && !btn.className.includes('disabled') && !btn.className.includes('secondary')) {
+            btn.click();
+            return btn.innerText;
+          }
+          return 'CLOSED: ' + btn.innerText;
+        }
+      }
+      return null;
+    });
+
+    let resultBuffer;
+    if (clickedBtnText && !clickedBtnText.startsWith('CLOSED:')) {
+      if (onProgress) onProgress(`✅ Tombol "${clickedBtnText}" diklik! Menunggu konfirmasi...`);
+      logs.push(`Klik tombol akhir: ${clickedBtnText}`);
+      await new Promise(r => setTimeout(r, 3000));
+      resultBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
+    } else if (clickedBtnText && clickedBtnText.startsWith('CLOSED:')) {
+      if (onProgress) onProgress(`❌ Tombol presensi abu-abu! Absensi sudah ditutup.`);
+      logs.push('Tombol presensi ditemukan tapi sudah ditutup (abu-abu).');
+      resultBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
+    } else {
+      logs.push('Tidak menemukan tombol presensi di halaman akhir.');
+      resultBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
+    }
+
+    await browser.close();
+    
+    return {
+      success: true,
+      mode: 'execute',
+      screenshot: resultBuffer,
+      btnStatus: clickedBtnText,
+      logs: logs
+    };
+
+  } catch (error) {
+    await browser.close();
+    return {
+      success: false,
+      error: error.message,
+      logs: logs
+    };
+  }
+}
+
+module.exports = { loginAndCheckEthol };
