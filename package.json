@@ -1,0 +1,23 @@
+{
+  "name": "classroom-assistant-bot",
+  "version": "1.0.0",
+  "description": "AI Assistant untuk Google Classroom via Telegram",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.14.0",
+    "dotenv": "^17.4.0",
+    "googleapis": "^171.4.0",
+    "node-cron": "^4.2.1",
+    "telegraf": "^4.16.3"
+  }
+}
