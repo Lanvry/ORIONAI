@@ -22,7 +22,7 @@ function formatTimeRemaining(dueDate) {
   const now = new Date();
   const diff = dueDate - now;
 
-  if (diff <= 0) return 'Sudah lewat deadline!';
+  if (diff <= 0) return '*Missing* (Lewat deadline!)';
 
   const hours = Math.floor(diff / 3600000);
   const days = Math.floor(hours / 24);
@@ -44,7 +44,7 @@ function formatTimeRemaining(dueDate) {
 function urgencyEmoji(dueDate) {
   if (!dueDate) return '⚪';
   const hours = (dueDate - new Date()) / 3600000;
-  if (hours <= 0) return '⛔';
+  if (hours <= 0) return '➖';
   if (hours <= 24) return '🔴';
   if (hours <= 72) return '🟠';
   if (hours <= 168) return '🟡';
@@ -114,41 +114,47 @@ function formatAssignmentDetail(a) {
 /**
  * Format daftar tugas dengan penomoran dan indikator urgensi (Markdown V1 safe)
  */
-function formatAssignmentList(assignments) {
-  if (!assignments.length) return '✅ Tidak ada tugas yang tertunda saat ini!';
+function formatAssignmentList(assignmentsObj) {
+  // Kompatibilitas mundur jika array yang dikirim
+  const pending = Array.isArray(assignmentsObj) ? assignmentsObj : assignmentsObj.pending || [];
+  const finished = Array.isArray(assignmentsObj) ? [] : assignmentsObj.finished || [];
 
-  let msg = '📋 *DAFTAR TUGAS AKTIF*\n\n';
+  if (!pending.length && !finished.length) return '✅ Tidak ada tugas yang aktif maupun selesai saat ini!';
 
-  // Sort: deadline terdekat dulu
-  const sorted = [...assignments].sort((a, b) => {
-    if (!a.dueDate && !b.dueDate) return 0;
-    if (!a.dueDate) return 1;
-    if (!b.dueDate) return -1;
-    return a.dueDate - b.dueDate;
-  });
+  let msg = '';
 
-  sorted.forEach((a, i) => {
-    const deadlineStr = a.dueDate
-      ? a.dueDate.toLocaleDateString('id-ID', {
-          day: '2-digit',
-          month: 'short',
-          year: 'numeric',
-        }) +
-        ' ' +
-        a.dueDate.toLocaleTimeString('id-ID', {
-          hour: '2-digit',
-          minute: '2-digit',
-        })
-      : 'Tanpa deadline';
+  if (pending.length) {
+    msg += '📋 *DAFTAR TUGAS AKTIF (BELUM SELESAI)*\n\n';
+    pending.forEach((a, i) => {
+      const deadlineStr = a.dueDate
+        ? a.dueDate.toLocaleDateString('id-ID', {
+            day: '2-digit', month: 'short', year: 'numeric',
+          }) + ' ' +
+          a.dueDate.toLocaleTimeString('id-ID', {
+            hour: '2-digit', minute: '2-digit',
+          })
+        : 'Tanpa deadline';
 
-    msg += urgencyEmoji(a.dueDate) + ' ' + (i + 1) + '. *' + escapeMd(a.title) + '*\n';
-    msg += '   📚 ' + escapeMd(a.courseName) + '\n';
-    msg += '   ⏰ ' + deadlineStr + '\n';
-    if (a.dueDate) msg += '   ⌛ ' + formatTimeRemaining(a.dueDate) + '\n';
-    msg += '\n';
-  });
+      msg += urgencyEmoji(a.dueDate) + ' ' + (i + 1) + '. *' + escapeMd(a.title) + '*\n';
+      msg += '   📚 ' + escapeMd(a.courseName) + '\n';
+      msg += '   ⏰ ' + deadlineStr + '\n';
+      if (a.dueDate) msg += '   ⌛ ' + formatTimeRemaining(a.dueDate) + '\n';
+      msg += '\n';
+    });
+  } else {
+    msg += '✨ *YEAAY!* Tidak ada tugas yang belum selesai!\n\n';
+  }
 
-  msg += '\n💡 Ketik /detail angka untuk detail lengkap\n';
+  if (finished.length) {
+    msg += '🎯 *TUGAS BARU SAJA SELESAI (Terbaru)*\n\n';
+    // Ambil 5 tugas selesai terakhir
+    finished.slice(0, 5).forEach((a, i) => {
+      msg += '✅ *' + escapeMd(a.title) + '*\n';
+      msg += '   📚 ' + escapeMd(a.courseName) + '\n\n';
+    });
+  }
+
+  msg += '\n💡 Ketik /detail angka untuk detail lengkap (dari tugas aktif)\n';
   msg += '💡 Ketik /ringkas angka untuk ringkasan AI';
 
   return msg;

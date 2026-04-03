@@ -45,7 +45,7 @@ function getGenAI() {
 // ─── AI Chat ──────────────────────────────────────────────────────────────────
 const chatHistories = {};
 
-async function askAI(chatId, userMessage, assignments, courses) {
+async function askAI(chatId, userMessage, assignmentsObj, courses) {
   const genAI = getGenAI();
   if (!genAI) {
     return 'Gemini API Key belum dikonfigurasi. Tambahkan GEMINI_API_KEY di file .env';
@@ -61,9 +61,12 @@ async function askAI(chatId, userMessage, assignments, courses) {
     });
   }
 
-  if (assignments && assignments.length > 0) {
-    tugasContext += '\n=== TUGAS AKTIF PEMILIK ===\n';
-    assignments.slice(0, 10).forEach(function(a, i) {
+  const pending = Array.isArray(assignmentsObj) ? assignmentsObj : assignmentsObj.pending || [];
+  const finished = Array.isArray(assignmentsObj) ? [] : assignmentsObj.finished || [];
+
+  if (pending.length > 0) {
+    tugasContext += '\n=== TUGAS AKTIF PENGGUNA (BELUM SELESAI) ===\n';
+    pending.slice(0, 10).forEach(function(a, i) {
       const deadline = a.dueDate
         ? a.dueDate.toLocaleString('id-ID', {
             day: '2-digit', month: 'short', year: 'numeric',
@@ -72,6 +75,14 @@ async function askAI(chatId, userMessage, assignments, courses) {
         : 'Tanpa deadline';
       tugasContext += (i + 1) + '. ' + a.title + ' (' + a.courseName + ') — Deadline: ' + deadline + '\n';
       if (a.description) tugasContext += '   Deskripsi: ' + a.description.slice(0, 100) + '...\n';
+    });
+    tugasContext += '===========================\n';
+  }
+
+  if (finished.length > 0) {
+    tugasContext += '\n=== TUGAS SUDAH SELESAI PENGGUNA (RIWAYAT) ===\n';
+    finished.slice(0, 10).forEach(function(a, i) {
+      tugasContext += (i + 1) + '. ' + a.title + ' (' + a.courseName + ') — Sudah dikumpulkan/dinilai\n';
     });
     tugasContext += '===========================\n';
   }
@@ -248,8 +259,9 @@ function register(bot) {
     }
     const loadingMsg = await ctx.reply('\uD83D\uDD04 Sedang mengambil data tugas dari Classroom...');
     try {
-      const assignments = await getPendingAssignments(userId);
-      await safeEdit(ctx, loadingMsg.message_id, formatAssignmentList(assignments), { parse_mode: 'Markdown', disable_web_page_preview: true });
+      const { getAllAssignments } = require('./classroomService');
+      const assignmentsObj = await getAllAssignments(userId);
+      await safeEdit(ctx, loadingMsg.message_id, formatAssignmentList(assignmentsObj), { parse_mode: 'Markdown', disable_web_page_preview: true });
     } catch (err) {
       await safeEdit(ctx, loadingMsg.message_id, 'Gagal mengambil tugas: ' + err.message);
     }
@@ -422,13 +434,14 @@ function register(bot) {
     if (state && state.step === 'AI_CHAT') {
       const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
       try {
-        let assignments = [];
+        let assignmentsObj = { pending: [], finished: [] };
         let courses = [];
         if (isAuthenticated(userId)) {
-          try { assignments = await getPendingAssignments(userId); } catch (e) {}
+          const { getAllAssignments } = require('./classroomService');
+          try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
           try { courses = await getCourses(userId); } catch (e) {}
         }
-        const answer = await askAI(chatId, text, assignments, courses);
+        const answer = await askAI(chatId, text, assignmentsObj, courses);
         await safeEdit(ctx, thinking.message_id, answer);
       } catch (err) {
         await safeEdit(ctx, thinking.message_id, 'Error AI: ' + err.message);
@@ -438,13 +451,14 @@ function register(bot) {
 
     const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
     try {
-      let assignments = [];
+      let assignmentsObj = { pending: [], finished: [] };
       let courses = [];
       if (isAuthenticated(userId)) {
-        try { assignments = await getPendingAssignments(userId); } catch (e) {}
+        const { getAllAssignments } = require('./classroomService');
+        try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
         try { courses = await getCourses(userId); } catch (e) {}
       }
-      const answer = await askAI(chatId, text, assignments, courses);
+      const answer = await askAI(chatId, text, assignmentsObj, courses);
       await safeEdit(ctx, thinking.message_id, answer);
     } catch (err) {
       await safeEdit(ctx, thinking.message_id, 'Orion error: ' + err.message + '\n\nPastikan GEMINI_API_KEY sudah diisi di .env');

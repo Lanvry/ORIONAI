@@ -11,8 +11,8 @@ function getUserCache(userId) {
     cache[userId] = {
       courses: null,
       coursesExpiry: 0,
-      pendingAssignments: null,
-      pendingExpiry: 0,
+      assignments: null,
+      assignmentsExpiry: 0,
     };
   }
   return cache[userId];
@@ -26,8 +26,8 @@ function invalidateCache(userId) {
   const userCache = getUserCache(userId);
   userCache.courses = null;
   userCache.coursesExpiry = 0;
-  userCache.pendingAssignments = null;
-  userCache.pendingExpiry = 0;
+  userCache.assignments = null;
+  userCache.assignmentsExpiry = 0;
 }
 
 /**
@@ -83,16 +83,17 @@ async function getMySubmission(userId, courseId, courseWorkId) {
 }
 
 /**
- * Ambil semua tugas yang belum dikumpulkan dengan deadline yang aktif
+ * Ambil semua tugas (dipisah mana yang pending dan mana yang sudah selesai)
  */
-async function getPendingAssignments(userId) {
+async function getAllAssignments(userId) {
   const userCache = getUserCache(userId);
-  if (userCache.pendingAssignments && isCacheValid(userCache.pendingExpiry)) {
-    return userCache.pendingAssignments;
+  if (userCache.assignments && isCacheValid(userCache.assignmentsExpiry)) {
+    return userCache.assignments;
   }
 
   const courses = await getCourses(userId);
   const pending = [];
+  const finished = [];
   const now = new Date();
 
   await Promise.all(courses.map(async (course) => {
@@ -128,33 +129,50 @@ async function getPendingAssignments(userId) {
         return;
       }
 
-      const state = submission ? submission.submissionState : null;
+      const state = submission ? submission.state : null;
+      const isFinished = (state === 'TURNED_IN' || state === 'RETURNED');
+      
+      const item = {
+        courseId: course.id,
+        courseName: course.name,
+        courseWorkId: cw.id,
+        title: cw.title,
+        description: cw.description || '',
+        dueDate,
+        alternateLink: cw.alternateLink,
+        submissionId: submission ? submission.id : null,
+        submissionState: state || 'NEW',
+      };
 
-      if (state !== 'TURNED_IN') {
-        pending.push({
-          courseId: course.id,
-          courseName: course.name,
-          courseWorkId: cw.id,
-          title: cw.title,
-          description: cw.description || '',
-          dueDate,
-          alternateLink: cw.alternateLink,
-          submissionId: submission ? submission.id : null,
-          submissionState: state || 'NEW',
-        });
+      if (isFinished) {
+        finished.push(item);
+      } else {
+        pending.push(item);
       }
     }));
   }));
 
-  pending.sort((a, b) => {
+  const sorter = (a, b) => {
     if (!a.dueDate && !b.dueDate) return 0;
     if (!a.dueDate) return 1;
     if (!b.dueDate) return -1;
     return a.dueDate - b.dueDate;
-  });
+  };
 
-  userCache.pendingAssignments = pending;
-  userCache.pendingExpiry = Date.now() + cache.TTL;
+  pending.sort(sorter);
+  finished.sort(sorter);
+
+  const assignmentsObj = { pending, finished };
+  userCache.assignments = assignmentsObj;
+  userCache.assignmentsExpiry = Date.now() + cache.TTL;
+  return assignmentsObj;
+}
+
+/**
+ * Pertahankan fungsi lama untuk kompatibilitas dengan cronJobs
+ */
+async function getPendingAssignments(userId) {
+  const { pending } = await getAllAssignments(userId);
   return pending;
 }
 
@@ -163,7 +181,7 @@ async function getPendingAssignments(userId) {
  */
 async function refreshAssignments(userId) {
   invalidateCache(userId);
-  return getPendingAssignments(userId);
+  return getAllAssignments(userId);
 }
 
 /**
@@ -214,6 +232,7 @@ module.exports = {
   getCourses,
   getCourseWork,
   getMySubmission,
+  getAllAssignments,
   getPendingAssignments,
   refreshAssignments,
   submitAssignment,
