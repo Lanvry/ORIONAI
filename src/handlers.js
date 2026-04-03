@@ -24,6 +24,19 @@ async function safeEdit(ctx, msgId, text, opts) {
     await ctx.telegram.editMessageText(ctx.chat.id, msgId, null, text, opts || {});
   } catch (err) {
     if (err.message && err.message.includes('message is not modified')) return;
+    
+    // Fallback jika formatting markdown cacat dari bawaan AI
+    if (err.message && err.message.includes("can't parse entities") && (opts && opts.parse_mode)) {
+      try {
+        const plainOpts = Object.assign({}, opts);
+        delete plainOpts.parse_mode;
+        await ctx.telegram.editMessageText(ctx.chat.id, msgId, null, text, plainOpts);
+      } catch (err2) {
+        if (!err2.message?.includes('modified')) console.error('[safeEdit Plain Error]', err2.message);
+      }
+      return;
+    }
+    
     console.error('[safeEdit Error]', err.message ? err.message.slice(0, 120) : err);
   }
 }
@@ -42,10 +55,55 @@ function getGenAI() {
   return genAIInstance;
 }
 
-// ─── AI Chat & Fallback OpenRouter ─────────────────────────────────────────────
+// ─── AI Chat & Fallback ─────────────────────────────────────────────
 const chatHistories = {};
 
-async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory) {
+async function askSiputzxGLM(chatId, userParts, systemInstruction, pastHistory, onStream) {
+  let hasImage = false;
+  let textPrompt = '';
+  
+  if (typeof userParts === 'string') {
+    textPrompt = userParts;
+  } else if (Array.isArray(userParts)) {
+    for (const part of userParts) {
+      if (typeof part === 'string') textPrompt += part + '\n';
+      else if (part.text) textPrompt += part.text + '\n';
+      else if (part.inlineData) hasImage = true;
+    }
+  }
+
+  // Jika ada gambar, lempar error karena endpoint ini umumnya hanya teks GET param
+  if (hasImage) {
+    throw new Error('Siputzx GLM-4 tidak mendukung input gambar. Lanjut ke fallback berikutnya.');
+  }
+
+  let historyText = '';
+  if (pastHistory && pastHistory.length > 0) {
+    historyText += '--- RIWAYAT CHAT ---\n';
+    for (const msg of pastHistory) {
+      const role = msg.role === 'model' ? 'Orion' : 'User';
+      const partsText = msg.parts.map(p => p.text).join('\n');
+      historyText += `${role}: ${partsText}\n`;
+    }
+    historyText += '--------------------\n\n';
+  }
+  
+  const finalPrompt = historyText + 'User: ' + textPrompt;
+
+  const url = `https://api.siputzx.my.id/api/ai/gptoss120b?prompt=${encodeURIComponent(finalPrompt)}&system=${encodeURIComponent(systemInstruction)}&temperature=0.7`;
+
+  if (onStream) onStream('Waiting for response...');
+
+  const response = await axios.get(url, { timeout: 30000 });
+  
+  if (response.data && response.data.status === true && response.data.data && response.data.data.response) {
+    return response.data.data.response;
+  } else {
+    throw new Error('Respons tidak valid dari Siputzx.');
+  }
+}
+
+async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory, onStream) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error('API Key OpenRouter tidak ada (.env).');
 
@@ -83,24 +141,80 @@ async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory) 
   messages.push({ role: 'user', content: currentUserContent });
   const modelQuery = 'qwen/qwen3.6-plus:free';
 
-  const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
-    model: process.env.OPENROUTER_MODEL || modelQuery,
-    messages: messages,
-    temperature: 0.7,
-  }, {
-    timeout: 60000,
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://github.com/Lanvry/ORIONAI',
-      'X-Title': 'Orion AI'
-    }
-  });
+  try {
+    const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+      model: process.env.OPENROUTER_MODEL || modelQuery,
+      messages: messages,
+      temperature: 0.7,
+      stream: true,
+    }, {
+      responseType: 'stream',
+      timeout: 60000,
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://github.com/Lanvry/ORIONAI',
+        'X-Title': 'Orion AI'
+      }
+    });
 
-  return response.data.choices[0].message.content;
+    return new Promise((resolve, reject) => {
+      let fullText = '';
+      let lastEditTime = Date.now();
+      let partialChunk = '';
+
+      response.data.on('data', (chunk) => {
+        partialChunk += chunk.toString('utf8');
+        const lines = partialChunk.split('\n');
+        partialChunk = lines.pop() || ''; 
+
+        for (let line of lines) {
+          line = line.trim();
+          if (line === 'data: [DONE]') continue;
+          if (line.startsWith('data: ')) {
+            try {
+              const parsed = JSON.parse(line.slice(6));
+              if (parsed.choices && parsed.choices[0].delta && parsed.choices[0].delta.content) {
+                fullText += parsed.choices[0].delta.content;
+              }
+            } catch (e) {
+              // Abaikan parse error per baris SSE
+            }
+          }
+        }
+
+        const now = Date.now();
+        // Update UI tiap 1500ms agar tidak over-limit API Telegram
+        if (now - lastEditTime > 1500) {
+          lastEditTime = now;
+          if (onStream && fullText) onStream(fullText);
+        }
+      });
+
+      response.data.on('end', () => resolve(fullText));
+      response.data.on('error', reject);
+    });
+  } catch (err) {
+    // Karena responseType='stream', error message biasanya tidak berupa JSON objek
+    const is429 = err.response && err.response.status === 429;
+    const retryCount = typeof this.retryCount === 'number' ? this.retryCount : 0;
+    
+    if (is429 && retryCount < 2) {
+      if (onStream) onStream('\u23F3 Server Qwen (OpenRouter) sedang penuh antrian (429). Mencoba ulang dalam 3 detik...');
+      await new Promise(r => setTimeout(r, 3000));
+      const boundFn = askOpenRouter.bind({ retryCount: retryCount + 1 });
+      return await boundFn(chatId, userParts, systemInstruction, pastHistory, onStream);
+    }
+    
+    let errMsg = err.message;
+    if (is429) {
+      errMsg = 'Terlalu banyak permintaan (Rate limit OpenRouter versi gratis tercapai). Silakan coba lagi nanti.';
+    }
+    throw new Error(`OpenRouter gagal: ${errMsg}`);
+  }
 }
 
-async function askAI(chatId, userMessage, assignmentsObj, courses) {
+async function askAI(chatId, userMessage, assignmentsObj, courses, onStream) {
   const genAI = getGenAI();
   if (!genAI) {
     return 'Gemini API Key belum dikonfigurasi. Tambahkan GEMINI_API_KEY di file .env';
@@ -171,15 +285,20 @@ async function askAI(chatId, userMessage, assignmentsObj, courses) {
   } catch (err) {
     const errMsg = err.message ? err.message.toLowerCase() : '';
     if (errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted')) {
-      console.warn('[AI] Gemini quota exhausted, falling back to OpenRouter (Qwen)...');
-      return await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory);
+      console.warn('[AI] Gemini quota exhausted, trying Siputzx GLM-4...');
+      try {
+        return await askSiputzxGLM(chatId, userMessage, systemInstructionText, pastHistory, onStream);
+      } catch (errGlm) {
+        console.warn('[AI] Siputzx GLM-4 failed:', errGlm.message, 'falling back to OpenRouter (Qwen)...');
+        return await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory, onStream);
+      }
     }
     throw err;
   }
 }
 
 // ─── Ringkas Tugas dengan AI ──────────────────────────────────────────────────
-async function ringkasAssignment(assignment) {
+async function ringkasAssignment(assignment, onStream) {
   const genAI = getGenAI();
   if (!genAI) return 'GEMINI_API_KEY belum dikonfigurasi.';
 
@@ -197,8 +316,13 @@ async function ringkasAssignment(assignment) {
   } catch (err) {
     const errMsg = err.message ? err.message.toLowerCase() : '';
     if (errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted')) {
-      console.warn('[AI] Gemini quota exhausted during summary, falling back to OpenRouter (Qwen)...');
-      return await askOpenRouter('ringkas', prompt, 'Kamu adalah AI asisten asisten akademik yang ahli merangkum.', []);
+      console.warn('[AI] Gemini quota exhausted during summary, trying Siputzx GLM-4...');
+      try {
+        return await askSiputzxGLM('ringkas', prompt, 'Kamu adalah AI asisten asisten akademik yang ahli merangkum.', [], onStream);
+      } catch (errGlm) {
+        console.warn('[AI] Siputzx GLM-4 failed:', errGlm.message, 'falling back to OpenRouter (Qwen)...');
+        return await askOpenRouter('ringkas', prompt, 'Kamu adalah AI asisten asisten akademik yang ahli merangkum.', [], onStream);
+      }
     }
     throw err;
   }
@@ -379,8 +503,10 @@ function register(bot) {
           return safeEdit(ctx, loadingMsg.message_id, 'Nomor tidak valid. Kamu punya ' + assignments.length + ' tugas aktif.');
         }
         const a = assignments[num - 1];
-        const ringkasan = await ringkasAssignment(a);
-        await safeEdit(ctx, loadingMsg.message_id, '\uD83D\uDCDD Ringkasan: ' + a.title + '\n\n' + ringkasan);
+        const ringkasan = await ringkasAssignment(a, async (streamingText) => {
+          await safeEdit(ctx, loadingMsg.message_id, '\uD83E\uDD16 AI sedang meringkas tugas...\n\n_...mengetik..._', { parse_mode: 'Markdown' });
+        });
+        await safeEdit(ctx, loadingMsg.message_id, '\uD83D\uDCDD Ringkasan: *' + a.title + '*\n\n' + ringkasan, { parse_mode: 'Markdown' });
       } catch (err) {
         await safeEdit(ctx, loadingMsg.message_id, 'Error: ' + err.message);
       }
@@ -517,8 +643,10 @@ function register(bot) {
             try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
             try { courses = await getCourses(userId); } catch (e) {}
           }
-          const answer = await askAI(chatId, text, assignmentsObj, courses);
-          await safeEdit(ctx, thinking.message_id, answer);
+          const answer = await askAI(chatId, text, assignmentsObj, courses, async (streamingText) => {
+            await safeEdit(ctx, thinking.message_id, streamingText + ' \u23F3', { parse_mode: 'Markdown' });
+          });
+          await safeEdit(ctx, thinking.message_id, answer, { parse_mode: 'Markdown' });
         } catch (err) {
           await safeEdit(ctx, thinking.message_id, 'Error AI: ' + err.message);
         }
@@ -536,8 +664,10 @@ function register(bot) {
           try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
           try { courses = await getCourses(userId); } catch (e) {}
         }
-        const answer = await askAI(chatId, text, assignmentsObj, courses);
-        await safeEdit(ctx, thinking.message_id, answer);
+        const answer = await askAI(chatId, text, assignmentsObj, courses, async (streamingText) => {
+          await safeEdit(ctx, thinking.message_id, streamingText + ' \u23F3', { parse_mode: 'Markdown' });
+        });
+        await safeEdit(ctx, thinking.message_id, answer, { parse_mode: 'Markdown' });
       } catch (err) {
         await safeEdit(ctx, thinking.message_id, 'Orion error: ' + err.message + '\n\nPastikan GEMINI_API_KEY sudah diisi di .env');
       }
@@ -617,8 +747,10 @@ function register(bot) {
         }
         fs.unlinkSync(tempPath);
 
-        const answer = await askAI(chatId, parts, assignmentsObj, courses);
-        await safeEdit(ctx, thinking.message_id, answer);
+        const answer = await askAI(chatId, parts, assignmentsObj, courses, async (streamingText) => {
+          await safeEdit(ctx, thinking.message_id, streamingText + ' \u23F3', { parse_mode: 'Markdown' });
+        });
+        await safeEdit(ctx, thinking.message_id, answer, { parse_mode: 'Markdown' });
       } catch (err) {
         await safeEdit(ctx, thinking.message_id, 'Error AI memproses file: ' + err.message);
       }
