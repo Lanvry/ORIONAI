@@ -465,88 +465,89 @@ function register(bot) {
     }
   });
 
-  async function handleFileUpload(ctx, fileId, fileName, mimeType) {
+  async function handleFileUpload(ctx, fileId, fileName, mimeType, caption) {
     const chatId = ctx.chat.id;
     const userId = ctx.from.id;
     const state = userState[chatId];
 
-    if (!state || state.step !== 'WAIT_FILE') {
+    // Jika sedang dalam proses mengumpulkan tugas, proses pengumpulan
+    if (state && (state.step === 'WAIT_FILE' || state.step === 'SELECT_ASSIGNMENT_FOR_UPLOAD')) {
       if (!isAuthenticated(userId)) {
-        return ctx.reply('Untuk mengumpulkan file, kamu harus Login Google terlebih dahulu.');
+        return ctx.reply('Untuk mengumpulkan file ke Classroom, kamu harus Login Google terlebih dahulu.');
       }
-      const loadingMsg = await ctx.reply('\uD83D\uDD04 Mengecek tugas untuk file ' + fileName + '...');
+      
+      const assignment = state.selectedAssignment;
+      
+      if (!assignment) {
+         return ctx.reply('Silakan pilih tugas dari menu Kumpulkan Tugas terlebih dahulu.');
+      }
+
+      if (!assignment.submissionId) {
+        return ctx.reply('Tidak ada submission ID. Pastikan kamu sudah terdaftar di mata kuliah ini.');
+      }
+
+      const statusMsg = await ctx.reply('\uD83D\uDCE4 Mengupload ke Google Drive...');
+
       try {
-        const assignments = await getPendingAssignments(userId);
-        if (!assignments.length) {
-          return safeEdit(ctx, loadingMsg.message_id, '\u2705 Kamu tidak punya tugas tertunda untuk dikumpulkan saat ini.');
-        }
+        const tempPath = await downloadTelegramFile(fileId, fileName);
+        await safeEdit(ctx, statusMsg.message_id, '\uD83D\uDCE4 Mengumpulkan ke Classroom...');
 
-        userState[chatId] = {
-          step: 'SELECT_ASSIGNMENT_FOR_UPLOAD',
-          assignments: assignments,
-          fileData: { fileId, fileName, mimeType }
-        };
+        const link = await submitAssignment(userId, assignment.courseId, assignment.courseWorkId, assignment.submissionId, tempPath, fileName, mimeType);
 
-        const buttons = assignments.map(function(a, i) {
-          return [(i + 1) + '. ' + a.title + ' (' + a.courseName + ')'];
-        });
-        buttons.push(['\u274C Batal']);
+        try { fs.unlinkSync(tempPath); } catch (e) {}
+        delete userState[chatId];
 
-        await safeEdit(ctx, loadingMsg.message_id, '\uD83D\uDCCB Mau dikumpulkan ke tugas yang mana?');
-        await ctx.reply('Pilih tugas:', {
-          reply_markup: { keyboard: buttons, resize_keyboard: true, one_time_keyboard: true }
-        });
-        return;
+        await safeEdit(ctx, statusMsg.message_id, '\u2705 Tugas berhasil dikumpulkan!\n\nTugas: ' + assignment.title + '\nMapel: ' + assignment.courseName + '\nFile: ' + fileName);
+        await ctx.reply('Kembali ke menu utama:', mainMenuKeyboard);
       } catch (err) {
-        return safeEdit(ctx, loadingMsg.message_id, 'Error saat menyiapkan upload: ' + err.message);
+        try { fs.unlinkSync(path.join(os.tmpdir(), fileName)); } catch (e) {}
+        await safeEdit(ctx, statusMsg.message_id, 'Gagal mengumpulkan tugas: ' + err.message);
       }
+      return;
     }
 
-    const assignment = state.selectedAssignment;
-
-    if (!assignment.submissionId) {
-      return ctx.reply('Tidak ada submission ID. Pastikan kamu sudah terdaftar di mata kuliah ini.');
-    }
-
-    const statusMsg = await ctx.reply('\uD83D\uDCE4 Mengupload ke Google Drive...');
-
+    // Jika tidak sedang mengumpulkan tugas, jadikan input untuk Gemini AI
+    const thinking = await ctx.reply('👀 Memeriksa file/gambar...');
     try {
-      const tempPath = await downloadTelegramFile(fileId, fileName);
-      await safeEdit(ctx, statusMsg.message_id, '\uD83D\uDCE4 Mengumpulkan ke Classroom...');
+      const tempFileName = 'temp_' + Date.now() + '_' + fileName;
+      const tempPath = await downloadTelegramFile(fileId, tempFileName);
+      
+      let assignmentsObj = { pending: [], finished: [] };
+      let courses = [];
+      if (isAuthenticated(userId)) {
+        const { getAllAssignments, getCourses } = require('./classroomService');
+        try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
+        try { courses = await getCourses(userId); } catch (e) {}
+      }
 
-      const link = await submitAssignment(
-        userId,
-        assignment.courseId,
-        assignment.courseWorkId,
-        assignment.submissionId,
-        tempPath,
-        fileName,
-        mimeType
-      );
+      const parts = [];
+      if (mimeType.startsWith('text/') || mimeType === 'application/javascript' || mimeType === 'application/json' || mimeType.includes('xml')) {
+          const textContent = fs.readFileSync(tempPath, 'utf8');
+          parts.push('Isi file (' + fileName + '):\n```\n' + textContent.slice(0, 10000) + '\n```\n\n' + (caption || 'Tolong jelaskan file ini.'));
+      } else {
+          const base64data = fs.readFileSync(tempPath).toString('base64');
+          parts.push({
+            inlineData: {
+              data: base64data,
+              mimeType: mimeType
+            }
+          });
+          parts.push(caption || 'Tolong analisa file/media ini.');
+      }
+      fs.unlinkSync(tempPath);
 
-      try { fs.unlinkSync(tempPath); } catch (e) {}
-      delete userState[chatId];
-
-      await safeEdit(
-        ctx,
-        statusMsg.message_id,
-        '\u2705 Tugas berhasil dikumpulkan!\n\n' +
-        'Tugas: ' + assignment.title + '\n' +
-        'Mapel: ' + assignment.courseName + '\n' +
-        'File: ' + fileName
-      );
-      await ctx.reply('Kembali ke menu utama:', mainMenuKeyboard);
+      const answer = await askAI(chatId, parts, assignmentsObj, courses);
+      await safeEdit(ctx, thinking.message_id, answer);
     } catch (err) {
-      try { fs.unlinkSync(path.join(os.tmpdir(), fileName)); } catch (e) {}
-      await safeEdit(ctx, statusMsg.message_id, 'Gagal mengumpulkan tugas: ' + err.message);
+      await safeEdit(ctx, thinking.message_id, 'Error AI memproses file: ' + err.message);
     }
-  };
+  }
 
   // Handler dokumen
   bot.on('document', async function(ctx) {
     const doc = ctx.message.document;
     const mimeType = doc.mime_type || getMimeType(doc.file_name || 'file');
-    await handleFileUpload(ctx, doc.file_id, doc.file_name || ('dokumen_' + Date.now()), mimeType);
+    await handleFileUpload(ctx, doc.file_id, doc.file_name || ('dokumen_' + Date.now()), mimeType, ctx.message.caption);
   });
 
   // Handler foto
@@ -554,7 +555,7 @@ function register(bot) {
     const photos = ctx.message.photo;
     const largest = photos[photos.length - 1];
     const fileName = 'foto_' + Date.now() + '.jpg';
-    await handleFileUpload(ctx, largest.file_id, fileName, 'image/jpeg');
+    await handleFileUpload(ctx, largest.file_id, fileName, 'image/jpeg', ctx.message.caption);
   });
 
   // Handler video
@@ -562,14 +563,14 @@ function register(bot) {
     const video = ctx.message.video;
     const fileName = video.file_name || ('video_' + Date.now() + '.mp4');
     const mimeType = video.mime_type || 'video/mp4';
-    await handleFileUpload(ctx, video.file_id, fileName, mimeType);
+    await handleFileUpload(ctx, video.file_id, fileName, mimeType, ctx.message.caption);
   });
 
   // Handler audio
   bot.on('audio', async function(ctx) {
     const audio = ctx.message.audio;
     const fileName = audio.file_name || ('audio_' + Date.now() + '.mp3');
-    await handleFileUpload(ctx, audio.file_id, fileName, audio.mime_type || 'audio/mpeg');
+    await handleFileUpload(ctx, audio.file_id, fileName, audio.mime_type || 'audio/mpeg', ctx.message.caption);
   });
 
   bot.telegram.setMyCommands([
