@@ -42,8 +42,63 @@ function getGenAI() {
   return genAIInstance;
 }
 
-// ─── AI Chat ──────────────────────────────────────────────────────────────────
+// ─── AI Chat & Fallback OpenRouter ─────────────────────────────────────────────
 const chatHistories = {};
+
+async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error('API Key OpenRouter tidak ada (.env).');
+
+  const messages = [];
+  messages.push({ role: 'system', content: systemInstruction });
+
+  for (const msg of pastHistory) {
+    const role = msg.role === 'model' ? 'assistant' : 'user';
+    const textParts = msg.parts.map(p => p.text).join('\n');
+    messages.push({ role, content: textParts });
+  }
+
+  let hasImage = false;
+  let currentUserContent;
+  
+  if (typeof userParts === 'string') {
+    currentUserContent = userParts;
+  } else if (Array.isArray(userParts)) {
+    currentUserContent = [];
+    for (const part of userParts) {
+      if (typeof part === 'string') {
+        currentUserContent.push({ type: 'text', text: part });
+      } else if (part.text) {
+        currentUserContent.push({ type: 'text', text: part.text });
+      } else if (part.inlineData) {
+        hasImage = true;
+        currentUserContent.push({
+          type: 'image_url',
+          image_url: { url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}` }
+        });
+      }
+    }
+  }
+
+  messages.push({ role: 'user', content: currentUserContent });
+  const modelQuery = 'qwen/qwen3.6-plus:free';
+
+  const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+    model: process.env.OPENROUTER_MODEL || modelQuery,
+    messages: messages,
+    temperature: 0.7,
+  }, {
+    timeout: 60000,
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://github.com/Lanvry/ORIONAI',
+      'X-Title': 'Orion AI'
+    }
+  });
+
+  return response.data.choices[0].message.content;
+}
 
 async function askAI(chatId, userMessage, assignmentsObj, courses) {
   const genAI = getGenAI();
@@ -90,29 +145,37 @@ async function askAI(chatId, userMessage, assignmentsObj, courses) {
   // Ambil history chat sebelumnya (jika ada) supaya konteks obrolan tidak hilang
   const pastHistory = chatHistories[chatId] ? await chatHistories[chatId].getHistory() : [];
 
+  const systemInstructionText = 'Kamu adalah Orion, asisten AI pribadi yang cerdas, ramah, dan proaktif mendampingi pemilikmu dalam perkuliahan.\n\n' +
+    'Instruksi Gaya Bahasa & Formatting (SANGAT PENTING):\n' +
+    '1. Gunakan gaya bahasa yang bersahabat, hangat, dan suportif (layaknya sahabat belajar terbaik).\n' +
+    '2. ✨ SELALU gunakan emoji yang menarik dan bervariasi di setiap kalimat atau daftar untuk mempercantik pesan.\n' +
+    '3. 📌 Jika menyebutkan daftar tugas atau materi, WAJIB gunakan bullet points atau daftar bernomor agar terlihat rapi dan elegan.\n' +
+    '4. Berikan spasi (enter/baris baru) antar paragraf supaya tidak sumpek dibaca di layar HP.\n' +
+    '5. Gunakan *huruf tebal (bold)* bebas untuk menebalkan judul tugas/mata kuliah, tetapi HINDARI _italic_ dan format markdown yang bertumpuk agar tidak memicu error parsing Telegram.\n' +
+    '6. Akhiri pesan dengan sapaan hangat atau semangat memotivasi! 🚀\n\n' +
+    tugasContext;
+
   // Selalu inisiasi ulang startChat dengan systemInstruction terbaru (yg berisi tugas aktif)
   chatHistories[chatId] = model.startChat({
     history: pastHistory,
     generationConfig: { maxOutputTokens: 2048, temperature: 0.7 },
     systemInstruction: {
       role: 'user',
-      parts: [{
-        text:
-          'Kamu adalah Orion, asisten AI pribadi yang cerdas, ramah, dan proaktif mendampingi pemilikmu dalam perkuliahan.\n\n' +
-          'Instruksi Gaya Bahasa & Formatting (SANGAT PENTING):\n' +
-          '1. Gunakan gaya bahasa yang bersahabat, hangat, dan suportif (layaknya sahabat belajar terbaik).\n' +
-          '2. ✨ SELALU gunakan emoji yang menarik dan bervariasi di setiap kalimat atau daftar untuk mempercantik pesan.\n' +
-          '3. 📌 Jika menyebutkan daftar tugas atau materi, WAJIB gunakan bullet points atau daftar bernomor agar terlihat rapi dan elegan.\n' +
-          '4. Berikan spasi (enter/baris baru) antar paragraf supaya tidak sumpek dibaca di layar HP.\n' +
-          '5. Gunakan *huruf tebal (bold)* bebas untuk menebalkan judul tugas/mata kuliah, tetapi HINDARI _italic_ dan format markdown yang bertumpuk agar tidak memicu error parsing Telegram.\n' +
-          '6. Akhiri pesan dengan sapaan hangat atau semangat memotivasi! 🚀\n\n' +
-          tugasContext
-      }]
+      parts: [{ text: systemInstructionText }]
     }
   });
 
-  const result = await chatHistories[chatId].sendMessage(userMessage);
-  return result.response.text();
+  try {
+    const result = await chatHistories[chatId].sendMessage(userMessage);
+    return result.response.text();
+  } catch (err) {
+    const errMsg = err.message ? err.message.toLowerCase() : '';
+    if (errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted')) {
+      console.warn('[AI] Gemini quota exhausted, falling back to OpenRouter (Qwen)...');
+      return await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory);
+    }
+    throw err;
+  }
 }
 
 // ─── Ringkas Tugas dengan AI ──────────────────────────────────────────────────
@@ -128,8 +191,17 @@ async function ringkasAssignment(assignment) {
     'Mata Kuliah: ' + assignment.courseName + '\n' +
     'Deskripsi: ' + (assignment.description || '(tidak ada deskripsi)');
 
-  const result = await model.generateContent(prompt);
-  return result.response.text();
+  try {
+    const result = await model.generateContent(prompt);
+    return result.response.text();
+  } catch (err) {
+    const errMsg = err.message ? err.message.toLowerCase() : '';
+    if (errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted')) {
+      console.warn('[AI] Gemini quota exhausted during summary, falling back to OpenRouter (Qwen)...');
+      return await askOpenRouter('ringkas', prompt, 'Kamu adalah AI asisten asisten akademik yang ahli merangkum.', []);
+    }
+    throw err;
+  }
 }
 
 // ─── Download File dari Telegram ─────────────────────────────────────────────
@@ -299,17 +371,20 @@ function register(bot) {
       return ctx.reply('Format: /ringkas <nomor>\nContoh: /ringkas 1\n\nGunakan Daftar Tugas untuk lihat nomor tugas.');
     }
     const loadingMsg = await ctx.reply('\uD83E\uDD16 AI sedang membaca deskripsi tugas...');
-    try {
-      const assignments = await getPendingAssignments(userId);
-      if (num < 1 || num > assignments.length) {
-        return safeEdit(ctx, loadingMsg.message_id, 'Nomor tidak valid. Kamu punya ' + assignments.length + ' tugas aktif.');
+    
+    (async () => {
+      try {
+        const assignments = await getPendingAssignments(userId);
+        if (num < 1 || num > assignments.length) {
+          return safeEdit(ctx, loadingMsg.message_id, 'Nomor tidak valid. Kamu punya ' + assignments.length + ' tugas aktif.');
+        }
+        const a = assignments[num - 1];
+        const ringkasan = await ringkasAssignment(a);
+        await safeEdit(ctx, loadingMsg.message_id, '\uD83D\uDCDD Ringkasan: ' + a.title + '\n\n' + ringkasan);
+      } catch (err) {
+        await safeEdit(ctx, loadingMsg.message_id, 'Error: ' + err.message);
       }
-      const a = assignments[num - 1];
-      const ringkasan = await ringkasAssignment(a);
-      await safeEdit(ctx, loadingMsg.message_id, '\uD83D\uDCDD Ringkasan: ' + a.title + '\n\n' + ringkasan);
-    } catch (err) {
-      await safeEdit(ctx, loadingMsg.message_id, 'Error: ' + err.message);
-    }
+    })();
   });
 
   // Daftar Mapel
@@ -433,36 +508,40 @@ function register(bot) {
 
     if (state && state.step === 'AI_CHAT') {
       const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
+      (async () => {
+        try {
+          let assignmentsObj = { pending: [], finished: [] };
+          let courses = [];
+          if (isAuthenticated(userId)) {
+            const { getAllAssignments, getCourses } = require('./classroomService');
+            try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
+            try { courses = await getCourses(userId); } catch (e) {}
+          }
+          const answer = await askAI(chatId, text, assignmentsObj, courses);
+          await safeEdit(ctx, thinking.message_id, answer);
+        } catch (err) {
+          await safeEdit(ctx, thinking.message_id, 'Error AI: ' + err.message);
+        }
+      })();
+      return;
+    }
+
+    const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
+    (async () => {
       try {
         let assignmentsObj = { pending: [], finished: [] };
         let courses = [];
         if (isAuthenticated(userId)) {
-          const { getAllAssignments } = require('./classroomService');
+          const { getAllAssignments, getCourses } = require('./classroomService');
           try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
           try { courses = await getCourses(userId); } catch (e) {}
         }
         const answer = await askAI(chatId, text, assignmentsObj, courses);
         await safeEdit(ctx, thinking.message_id, answer);
       } catch (err) {
-        await safeEdit(ctx, thinking.message_id, 'Error AI: ' + err.message);
+        await safeEdit(ctx, thinking.message_id, 'Orion error: ' + err.message + '\n\nPastikan GEMINI_API_KEY sudah diisi di .env');
       }
-      return;
-    }
-
-    const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
-    try {
-      let assignmentsObj = { pending: [], finished: [] };
-      let courses = [];
-      if (isAuthenticated(userId)) {
-        const { getAllAssignments } = require('./classroomService');
-        try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
-        try { courses = await getCourses(userId); } catch (e) {}
-      }
-      const answer = await askAI(chatId, text, assignmentsObj, courses);
-      await safeEdit(ctx, thinking.message_id, answer);
-    } catch (err) {
-      await safeEdit(ctx, thinking.message_id, 'Orion error: ' + err.message + '\n\nPastikan GEMINI_API_KEY sudah diisi di .env');
-    }
+    })();
   });
 
   async function handleFileUpload(ctx, fileId, fileName, mimeType, caption) {
@@ -508,39 +587,42 @@ function register(bot) {
 
     // Jika tidak sedang mengumpulkan tugas, jadikan input untuk Gemini AI
     const thinking = await ctx.reply('👀 Memeriksa file/gambar...');
-    try {
-      const tempFileName = 'temp_' + Date.now() + '_' + fileName;
-      const tempPath = await downloadTelegramFile(fileId, tempFileName);
-      
-      let assignmentsObj = { pending: [], finished: [] };
-      let courses = [];
-      if (isAuthenticated(userId)) {
-        const { getAllAssignments, getCourses } = require('./classroomService');
-        try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
-        try { courses = await getCourses(userId); } catch (e) {}
-      }
+    
+    (async () => {
+      try {
+        const tempFileName = 'temp_' + Date.now() + '_' + fileName;
+        const tempPath = await downloadTelegramFile(fileId, tempFileName);
+        
+        let assignmentsObj = { pending: [], finished: [] };
+        let courses = [];
+        if (isAuthenticated(userId)) {
+          const { getAllAssignments, getCourses } = require('./classroomService');
+          try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
+          try { courses = await getCourses(userId); } catch (e) {}
+        }
 
-      const parts = [];
-      if (mimeType.startsWith('text/') || mimeType === 'application/javascript' || mimeType === 'application/json' || mimeType.includes('xml')) {
-          const textContent = fs.readFileSync(tempPath, 'utf8');
-          parts.push('Isi file (' + fileName + '):\n```\n' + textContent.slice(0, 10000) + '\n```\n\n' + (caption || 'Tolong jelaskan file ini.'));
-      } else {
-          const base64data = fs.readFileSync(tempPath).toString('base64');
-          parts.push({
-            inlineData: {
-              data: base64data,
-              mimeType: mimeType
-            }
-          });
-          parts.push(caption || 'Tolong analisa file/media ini.');
-      }
-      fs.unlinkSync(tempPath);
+        const parts = [];
+        if (mimeType.startsWith('text/') || mimeType === 'application/javascript' || mimeType === 'application/json' || mimeType.includes('xml')) {
+            const textContent = fs.readFileSync(tempPath, 'utf8');
+            parts.push('Isi file (' + fileName + '):\n```\n' + textContent.slice(0, 10000) + '\n```\n\n' + (caption || 'Tolong jelaskan file ini.'));
+        } else {
+            const base64data = fs.readFileSync(tempPath).toString('base64');
+            parts.push({
+              inlineData: {
+                data: base64data,
+                mimeType: mimeType
+              }
+            });
+            parts.push(caption || 'Tolong analisa file/media ini.');
+        }
+        fs.unlinkSync(tempPath);
 
-      const answer = await askAI(chatId, parts, assignmentsObj, courses);
-      await safeEdit(ctx, thinking.message_id, answer);
-    } catch (err) {
-      await safeEdit(ctx, thinking.message_id, 'Error AI memproses file: ' + err.message);
-    }
+        const answer = await askAI(chatId, parts, assignmentsObj, courses);
+        await safeEdit(ctx, thinking.message_id, answer);
+      } catch (err) {
+        await safeEdit(ctx, thinking.message_id, 'Error AI memproses file: ' + err.message);
+      }
+    })();
   }
 
   // Handler dokumen
