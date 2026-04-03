@@ -2,7 +2,15 @@ const { google } = require('googleapis');
 const fs = require('fs');
 const path = require('path');
 
-const TOKEN_PATH = path.join(__dirname, '../token.json');
+const TOKEN_DIR = path.join(__dirname, '../data/users');
+
+function getTokenPath(userId) {
+  if (!fs.existsSync(TOKEN_DIR)) {
+    fs.mkdirSync(TOKEN_DIR, { recursive: true });
+  }
+  return path.join(TOKEN_DIR, `${userId}.json`);
+}
+
 const SCOPES = [
   'https://www.googleapis.com/auth/classroom.courses.readonly',
   'https://www.googleapis.com/auth/classroom.coursework.me.readonly',
@@ -38,12 +46,14 @@ function getAuthUrl() {
 /**
  * Menyimpan token ke file
  */
-async function saveToken(code) {
+async function saveToken(code, userId) {
   const oAuth2Client = createOAuthClient();
   const { tokens } = await oAuth2Client.getToken(code);
   oAuth2Client.setCredentials(tokens);
-  fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
-  console.log('✅ Token Google berhasil disimpan.');
+  
+  const tokenPath = getTokenPath(userId);
+  fs.writeFileSync(tokenPath, JSON.stringify(tokens, null, 2));
+  console.log(`✅ Token Google berhasil disimpan untuk user ${userId}.`);
   return oAuth2Client;
 }
 
@@ -60,11 +70,12 @@ function isTokenExpired(token) {
  * Load token dari file & return client yang sudah terautentikasi
  * Auto-refresh token jika expired
  */
-async function getAuthenticatedClient() {
-  if (!fs.existsSync(TOKEN_PATH)) return null;
+async function getAuthenticatedClient(userId) {
+  const tokenPath = getTokenPath(userId);
+  if (!fs.existsSync(tokenPath)) return null;
 
   const oAuth2Client = createOAuthClient();
-  let token = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf-8'));
+  let token = JSON.parse(fs.readFileSync(tokenPath, 'utf-8'));
 
   // Auto-refresh jika expired
   if (isTokenExpired(token) && token.refresh_token) {
@@ -72,10 +83,10 @@ async function getAuthenticatedClient() {
       oAuth2Client.setCredentials(token);
       const { credentials } = await oAuth2Client.refreshAccessToken();
       token = credentials;
-      fs.writeFileSync(TOKEN_PATH, JSON.stringify(token, null, 2));
-      console.log('🔄 Token Google berhasil diperbarui (auto-refresh).');
+      fs.writeFileSync(tokenPath, JSON.stringify(token, null, 2));
+      console.log(`🔄 Token Google berhasil diperbarui untuk user ${userId}.`);
     } catch (err) {
-      console.error('⚠️ Gagal refresh token:', err.message);
+      console.error(`⚠️ Gagal refresh token untuk ${userId}:`, err.message);
       // Tetap coba pakai token lama
     }
   }
@@ -87,10 +98,11 @@ async function getAuthenticatedClient() {
 /**
  * Versi sinkron (untuk backward-compat, tidak auto-refresh)
  */
-function getAuthenticatedClientSync() {
-  if (!fs.existsSync(TOKEN_PATH)) return null;
+function getAuthenticatedClientSync(userId) {
+  const tokenPath = getTokenPath(userId);
+  if (!fs.existsSync(tokenPath)) return null;
   const oAuth2Client = createOAuthClient();
-  const token = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf-8'));
+  const token = JSON.parse(fs.readFileSync(tokenPath, 'utf-8'));
   oAuth2Client.setCredentials(token);
   return oAuth2Client;
 }
@@ -98,8 +110,8 @@ function getAuthenticatedClientSync() {
 /**
  * Cek apakah sudah login Google
  */
-function isAuthenticated() {
-  return fs.existsSync(TOKEN_PATH);
+function isAuthenticated(userId) {
+  return fs.existsSync(getTokenPath(userId));
 }
 
 module.exports = {

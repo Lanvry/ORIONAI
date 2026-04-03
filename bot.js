@@ -2,6 +2,7 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const cronJobs = require('./src/cronJobs');
 const handlers = require('./src/handlers');
+const { startOAuthServer } = require('./setup/oauth-server');
 
 // ── Validasi ENV kritis ───────────────────────────────────────────────────────
 if (!process.env.TELEGRAM_BOT_TOKEN) {
@@ -39,8 +40,13 @@ bot.catch((err, ctx) => {
   } catch (_) {}
 });
 
-// ── Start Cron Jobs ──────────────────────────────────────────────────────────
+// ── Start Cron Jobs & Web Server ─────────────────────────────────────────────
 cronJobs.start();
+try {
+  startOAuthServer();
+} catch (e) {
+  console.log('⚠️ Gagal memulai OAuth Server:', e.message);
+}
 
 // ── Launch Bot ───────────────────────────────────────────────────────────────
 bot.launch({ dropPendingUpdates: true })

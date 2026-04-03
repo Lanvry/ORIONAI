@@ -3,49 +3,59 @@ const { getAuthenticatedClient } = require('./googleAuth');
 
 // ─── Cache ─────────────────────────────────────────────────────────────────
 const cache = {
-  courses: null,
-  coursesExpiry: 0,
-  pendingAssignments: null,
-  pendingExpiry: 0,
   TTL: 5 * 60 * 1000, // 5 menit
 };
+
+function getUserCache(userId) {
+  if (!cache[userId]) {
+    cache[userId] = {
+      courses: null,
+      coursesExpiry: 0,
+      pendingAssignments: null,
+      pendingExpiry: 0,
+    };
+  }
+  return cache[userId];
+}
 
 function isCacheValid(expiry) {
   return Date.now() < expiry;
 }
 
-function invalidateCache() {
-  cache.courses = null;
-  cache.coursesExpiry = 0;
-  cache.pendingAssignments = null;
-  cache.pendingExpiry = 0;
+function invalidateCache(userId) {
+  const userCache = getUserCache(userId);
+  userCache.courses = null;
+  userCache.coursesExpiry = 0;
+  userCache.pendingAssignments = null;
+  userCache.pendingExpiry = 0;
 }
 
 /**
  * Ambil semua mata pelajaran (courses) aktif
  */
-async function getCourses() {
-  if (cache.courses && isCacheValid(cache.coursesExpiry)) {
-    return cache.courses;
+async function getCourses(userId) {
+  const userCache = getUserCache(userId);
+  if (userCache.courses && isCacheValid(userCache.coursesExpiry)) {
+    return userCache.courses;
   }
 
-  const auth = await getAuthenticatedClient();
+  const auth = await getAuthenticatedClient(userId);
   if (!auth) throw new Error('Belum login Google. Silakan tekan 🔗 Login Google.');
 
   const classroom = google.classroom({ version: 'v1', auth });
   const res = await classroom.courses.list({ courseStates: ['ACTIVE'] });
   const courses = res.data.courses || [];
 
-  cache.courses = courses;
-  cache.coursesExpiry = Date.now() + cache.TTL;
+  userCache.courses = courses;
+  userCache.coursesExpiry = Date.now() + cache.TTL;
   return courses;
 }
 
 /**
  * Ambil semua tugas dari satu course
  */
-async function getCourseWork(courseId) {
-  const auth = await getAuthenticatedClient();
+async function getCourseWork(userId, courseId) {
+  const auth = await getAuthenticatedClient(userId);
   if (!auth) throw new Error('Belum login Google.');
   const classroom = google.classroom({ version: 'v1', auth });
 
@@ -59,8 +69,8 @@ async function getCourseWork(courseId) {
 /**
  * Ambil submission saya untuk tugas tertentu
  */
-async function getMySubmission(courseId, courseWorkId) {
-  const auth = await getAuthenticatedClient();
+async function getMySubmission(userId, courseId, courseWorkId) {
+  const auth = await getAuthenticatedClient(userId);
   if (!auth) throw new Error('Belum login Google.');
   const classroom = google.classroom({ version: 'v1', auth });
 
@@ -75,21 +85,22 @@ async function getMySubmission(courseId, courseWorkId) {
 /**
  * Ambil semua tugas yang belum dikumpulkan dengan deadline yang aktif
  */
-async function getPendingAssignments() {
-  if (cache.pendingAssignments && isCacheValid(cache.pendingExpiry)) {
-    return cache.pendingAssignments;
+async function getPendingAssignments(userId) {
+  const userCache = getUserCache(userId);
+  if (userCache.pendingAssignments && isCacheValid(userCache.pendingExpiry)) {
+    return userCache.pendingAssignments;
   }
 
-  const courses = await getCourses();
+  const courses = await getCourses(userId);
   const pending = [];
   const now = new Date();
 
   await Promise.all(courses.map(async (course) => {
     let courseWorks = [];
     try {
-      courseWorks = await getCourseWork(course.id);
+      courseWorks = await getCourseWork(userId, course.id);
     } catch (err) {
-      console.warn(`[Classroom] Gagal ambil courseWork untuk ${course.name}: ${err.message}`);
+      console.warn(`[Classroom] Gagal ambil courseWork untuk user ${userId} course ${course.name}: ${err.message}`);
       return;
     }
 
@@ -101,9 +112,6 @@ async function getPendingAssignments() {
         dueDate = new Date(year, month - 1, day, hours, minutes);
       }
 
-      // Kita tidak akan membuang tugas yang HANYA lewat deadline, karena mahasiswa sering kumpul telat (Missing).
-      // Sebaliknya, buang tugas yang usianya sudah sangat lama (misal lebih dari 30 hari sejak dibuat)
-      // untuk memenuhi permintaan user "hanya tugas terbaru saja"
       if (cw.creationTime) {
         const createdAt = new Date(cw.creationTime);
         const diffDays = (now - createdAt) / (1000 * 60 * 60 * 24);
@@ -114,15 +122,14 @@ async function getPendingAssignments() {
 
       let submission = null;
       try {
-        submission = await getMySubmission(course.id, cw.id);
+        submission = await getMySubmission(userId, course.id, cw.id);
       } catch (err) {
-        console.warn(`[Classroom] Gagal ambil submission ${cw.title}: ${err.message}`);
+        console.warn(`[Classroom] Gagal ambil submission user ${userId} task ${cw.title}: ${err.message}`);
         return;
       }
 
       const state = submission ? submission.submissionState : null;
 
-      // Jika belum dikumpulkan (bukan TURNED_IN)
       if (state !== 'TURNED_IN') {
         pending.push({
           courseId: course.id,
@@ -139,7 +146,6 @@ async function getPendingAssignments() {
     }));
   }));
 
-  // Sort berdasarkan deadline terdekat
   pending.sort((a, b) => {
     if (!a.dueDate && !b.dueDate) return 0;
     if (!a.dueDate) return 1;
@@ -147,24 +153,24 @@ async function getPendingAssignments() {
     return a.dueDate - b.dueDate;
   });
 
-  cache.pendingAssignments = pending;
-  cache.pendingExpiry = Date.now() + cache.TTL;
+  userCache.pendingAssignments = pending;
+  userCache.pendingExpiry = Date.now() + cache.TTL;
   return pending;
 }
 
 /**
  * Force refresh cache dan ambil tugas baru
  */
-async function refreshAssignments() {
-  invalidateCache();
-  return getPendingAssignments();
+async function refreshAssignments(userId) {
+  invalidateCache(userId);
+  return getPendingAssignments(userId);
 }
 
 /**
  * Upload file ke Google Drive dan attach ke submission, lalu Turn In
  */
-async function submitAssignment(courseId, courseWorkId, submissionId, filePath, fileName, mimeType) {
-  const auth = await getAuthenticatedClient();
+async function submitAssignment(userId, courseId, courseWorkId, submissionId, filePath, fileName, mimeType) {
+  const auth = await getAuthenticatedClient(userId);
   if (!auth) throw new Error('Belum login Google.');
 
   const classroom = google.classroom({ version: 'v1', auth });
@@ -199,7 +205,7 @@ async function submitAssignment(courseId, courseWorkId, submissionId, filePath, 
   });
 
   // Invalidate cache setelah submit
-  invalidateCache();
+  invalidateCache(userId);
 
   return fileLink;
 }

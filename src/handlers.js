@@ -216,10 +216,11 @@ function register(bot) {
   bot.command('auth', async function(ctx) {
     const code = ctx.message.text.split(' ').slice(1).join(' ').trim();
     if (!code) return ctx.reply('Format: /auth KODE_OTORISASI');
+    const userId = ctx.from.id;
 
     try {
       await ctx.reply('\uD83D\uDD04 Memverifikasi kode...');
-      await saveToken(code);
+      await saveToken(code, userId);
       await ctx.reply('\u2705 Login Google berhasil! Sekarang Orion bisa mengakses Classroom kamu.', mainMenuKeyboard);
     } catch (err) {
       await ctx.reply('Gagal login: ' + err.message);
@@ -228,10 +229,11 @@ function register(bot) {
 
   // /refresh
   bot.command('refresh', async function(ctx) {
-    if (!isAuthenticated()) return ctx.reply('Belum login Google.');
+    const userId = ctx.from.id;
+    if (!isAuthenticated(userId)) return ctx.reply('Belum login Google.');
     const msg = await ctx.reply('\uD83D\uDD04 Memperbarui data dari Classroom...');
     try {
-      const assignments = await refreshAssignments();
+      const assignments = await refreshAssignments(userId);
       await safeEdit(ctx, msg.message_id, '\u2705 Data diperbarui! Ditemukan ' + assignments.length + ' tugas aktif.');
     } catch (err) {
       await safeEdit(ctx, msg.message_id, 'Gagal refresh: ' + err.message);
@@ -240,12 +242,13 @@ function register(bot) {
 
   // Daftar Tugas
   bot.hears(['\uD83D\uDCCB Daftar Tugas', '/tugas'], async function(ctx) {
-    if (!isAuthenticated()) {
+    const userId = ctx.from.id;
+    if (!isAuthenticated(userId)) {
       return ctx.reply('Kamu belum login Google. Tekan Login Google terlebih dahulu.');
     }
     const loadingMsg = await ctx.reply('\uD83D\uDD04 Sedang mengambil data tugas dari Classroom...');
     try {
-      const assignments = await getPendingAssignments();
+      const assignments = await getPendingAssignments(userId);
       await safeEdit(ctx, loadingMsg.message_id, formatAssignmentList(assignments), { parse_mode: 'Markdown', disable_web_page_preview: true });
     } catch (err) {
       await safeEdit(ctx, loadingMsg.message_id, 'Gagal mengambil tugas: ' + err.message);
@@ -254,7 +257,8 @@ function register(bot) {
 
   // /detail <nomor>
   bot.command('detail', async function(ctx) {
-    if (!isAuthenticated()) return ctx.reply('Belum login Google.');
+    const userId = ctx.from.id;
+    if (!isAuthenticated(userId)) return ctx.reply('Belum login Google.');
     const numStr = ctx.message.text.split(' ')[1];
     const num = parseInt(numStr);
     if (!numStr || isNaN(num)) {
@@ -262,7 +266,7 @@ function register(bot) {
     }
     const loadingMsg = await ctx.reply('\uD83D\uDD04 Mengambil detail tugas...');
     try {
-      const assignments = await getPendingAssignments();
+      const assignments = await getPendingAssignments(userId);
       if (num < 1 || num > assignments.length) {
         return safeEdit(ctx, loadingMsg.message_id, 'Nomor tidak valid. Kamu punya ' + assignments.length + ' tugas aktif.');
       }
@@ -275,7 +279,8 @@ function register(bot) {
 
   // /ringkas <nomor>
   bot.command('ringkas', async function(ctx) {
-    if (!isAuthenticated()) return ctx.reply('Belum login Google.');
+    const userId = ctx.from.id;
+    if (!isAuthenticated(userId)) return ctx.reply('Belum login Google.');
     const numStr = ctx.message.text.split(' ')[1];
     const num = parseInt(numStr);
     if (!numStr || isNaN(num)) {
@@ -283,13 +288,12 @@ function register(bot) {
     }
     const loadingMsg = await ctx.reply('\uD83E\uDD16 AI sedang membaca deskripsi tugas...');
     try {
-      const assignments = await getPendingAssignments();
+      const assignments = await getPendingAssignments(userId);
       if (num < 1 || num > assignments.length) {
         return safeEdit(ctx, loadingMsg.message_id, 'Nomor tidak valid. Kamu punya ' + assignments.length + ' tugas aktif.');
       }
       const a = assignments[num - 1];
       const ringkasan = await ringkasAssignment(a);
-      // Kirim sebagai plain text agar tidak ada parse error dari AI output
       await safeEdit(ctx, loadingMsg.message_id, '\uD83D\uDCDD Ringkasan: ' + a.title + '\n\n' + ringkasan);
     } catch (err) {
       await safeEdit(ctx, loadingMsg.message_id, 'Error: ' + err.message);
@@ -298,11 +302,12 @@ function register(bot) {
 
   // Daftar Mapel
   bot.hears(['\uD83D\uDCDA Daftar Mapel', '/mapel'], async function(ctx) {
-    if (!isAuthenticated()) {
+    const userId = ctx.from.id;
+    if (!isAuthenticated(userId)) {
       return ctx.reply('Kamu belum login Google. Tekan Login Google terlebih dahulu.');
     }
     try {
-      const courses = await getCourses();
+      const courses = await getCourses(userId);
       if (!courses.length) return ctx.reply('Tidak ada mata kuliah aktif.');
       let msg = '\uD83D\uDCDA MATA KULIAH AKTIF\n\n';
       courses.forEach(function(c, i) {
@@ -318,13 +323,14 @@ function register(bot) {
 
   // ─── Flow Kumpulkan Tugas ──────────────────────────────────────────────────
   bot.hears(['\u2705 Kumpulkan Tugas', '/kumpulkan'], async function(ctx) {
-    if (!isAuthenticated()) {
+    const userId = ctx.from.id;
+    if (!isAuthenticated(userId)) {
       return ctx.reply('Kamu belum login Google. Tekan Login Google terlebih dahulu.');
     }
     const chatId = ctx.chat.id;
     const loadingMsg = await ctx.reply('\uD83D\uDD04 Sedang memuat daftar tugas...');
     try {
-      const assignments = await getPendingAssignments();
+      const assignments = await getPendingAssignments(userId);
       if (!assignments.length) {
         await safeEdit(ctx, loadingMsg.message_id, '\u2705 Tidak ada tugas yang perlu dikumpulkan!');
         return;
@@ -367,10 +373,11 @@ function register(bot) {
   // ─── Handler Pesan Teks Umum ──────────────────────────────────────────────
   bot.on('text', async function(ctx) {
     const chatId = ctx.chat.id;
+    const userId = ctx.from.id;
     const text = ctx.message.text;
     const state = userState[chatId];
 
-    // State: Pilih tugas untuk dikumpulkan
+    // ... (State codes untu PILIH TUGAS)
     if (state && state.step === 'SELECT_ASSIGNMENT') {
       const match = text.match(/^(\d+)\./);
       if (match) {
@@ -390,15 +397,12 @@ function register(bot) {
       return ctx.reply('Pilihan tidak valid. Ketik nomor tugas yang sesuai.');
     }
 
-    // State: Selesai pilih tugas SETELAH kirim file
     if (state && state.step === 'SELECT_ASSIGNMENT_FOR_UPLOAD') {
       const match = text.match(/^(\d+)\./);
       if (match) {
         const idx = parseInt(match[1]) - 1;
         const selected = state.assignments[idx];
         if (selected) {
-          // Lanjut ke upload file yang sudah di-save sebelumnya
-          // Fake state supaya handleFileUpload bisa lewat validasi
           userState[chatId] = { step: 'WAIT_FILE', selectedAssignment: selected };
           const fileData = state.fileData;
           await ctx.reply('\uD83D\uDCCB Memproses pengumpulan file...', { reply_markup: { remove_keyboard: true } });
@@ -415,15 +419,14 @@ function register(bot) {
       });
     }
 
-    // State: AI Chat
     if (state && state.step === 'AI_CHAT') {
       const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
       try {
         let assignments = [];
         let courses = [];
-        if (isAuthenticated()) {
-          try { assignments = await getPendingAssignments(); } catch (e) {}
-          try { courses = await getCourses(); } catch (e) {}
+        if (isAuthenticated(userId)) {
+          try { assignments = await getPendingAssignments(userId); } catch (e) {}
+          try { courses = await getCourses(userId); } catch (e) {}
         }
         const answer = await askAI(chatId, text, assignments, courses);
         await safeEdit(ctx, thinking.message_id, answer);
@@ -433,14 +436,13 @@ function register(bot) {
       return;
     }
 
-    // Default: jawab dengan AI tanpa state
     const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
     try {
       let assignments = [];
       let courses = [];
-      if (isAuthenticated()) {
-        try { assignments = await getPendingAssignments(); } catch (e) {}
-        try { courses = await getCourses(); } catch (e) {}
+      if (isAuthenticated(userId)) {
+        try { assignments = await getPendingAssignments(userId); } catch (e) {}
+        try { courses = await getCourses(userId); } catch (e) {}
       }
       const answer = await askAI(chatId, text, assignments, courses);
       await safeEdit(ctx, thinking.message_id, answer);
@@ -449,19 +451,18 @@ function register(bot) {
     }
   });
 
-  // ─── Handler File Upload ──────────────────────────────────────────────────
   async function handleFileUpload(ctx, fileId, fileName, mimeType) {
     const chatId = ctx.chat.id;
+    const userId = ctx.from.id;
     const state = userState[chatId];
 
     if (!state || state.step !== 'WAIT_FILE') {
-      // Jika pengguna tiba-tiba kirim file, tawarkan daftar tugas!
-      if (!isAuthenticated()) {
+      if (!isAuthenticated(userId)) {
         return ctx.reply('Untuk mengumpulkan file, kamu harus Login Google terlebih dahulu.');
       }
       const loadingMsg = await ctx.reply('\uD83D\uDD04 Mengecek tugas untuk file ' + fileName + '...');
       try {
-        const assignments = await getPendingAssignments();
+        const assignments = await getPendingAssignments(userId);
         if (!assignments.length) {
           return safeEdit(ctx, loadingMsg.message_id, '\u2705 Kamu tidak punya tugas tertunda untuk dikumpulkan saat ini.');
         }
@@ -500,6 +501,7 @@ function register(bot) {
       await safeEdit(ctx, statusMsg.message_id, '\uD83D\uDCE4 Mengumpulkan ke Classroom...');
 
       const link = await submitAssignment(
+        userId,
         assignment.courseId,
         assignment.courseWorkId,
         assignment.submissionId,

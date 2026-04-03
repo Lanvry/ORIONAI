@@ -1,6 +1,7 @@
 # Environment & Secrets
 .env
 token.json
+data/
 
 # Dependencies
 node_modules/
