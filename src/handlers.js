@@ -50,15 +50,24 @@ async function safeEdit(ctx, msgId, text, opts) {
 // ─── State Sementara Per User ─────────────────────────────────────────────────
 const userState = {}; // { [chatId]: { step, assignments, selectedAssignment } }
 
-// ─── AI Instance ──────────────────────────────────────────────────────────────
-let genAIInstance = null;
+// ─── AI Instance (Multi-Key Rotation) ─────────────────────────────────────────
+const GEMINI_KEYS = [];
+const genAIInstances = {};
 
-function getGenAI() {
-  if (!process.env.GEMINI_API_KEY) return null;
-  if (!genAIInstance) {
-    genAIInstance = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+function initGeminiKeys() {
+  if (GEMINI_KEYS.length > 0) return;
+  if (process.env.GEMINI_API_KEY) GEMINI_KEYS.push(process.env.GEMINI_API_KEY);
+  if (process.env.GEMINI_API_KEY_2) GEMINI_KEYS.push(process.env.GEMINI_API_KEY_2);
+}
+
+function getGenAI(keyIndex = 0) {
+  initGeminiKeys();
+  if (keyIndex >= GEMINI_KEYS.length) return null;
+  const key = GEMINI_KEYS[keyIndex];
+  if (!genAIInstances[key]) {
+    genAIInstances[key] = new GoogleGenerativeAI(key);
   }
-  return genAIInstance;
+  return genAIInstances[key];
 }
 
 // ─── AI Chat & Fallback ─────────────────────────────────────────────
@@ -220,13 +229,33 @@ async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory, 
   }
 }
 
-async function askAI(chatId, userMessage, assignmentsObj, courses, onStream) {
-  const genAI = getGenAI();
-  if (!genAI) {
-    return 'Gemini API Key belum dikonfigurasi. Tambahkan GEMINI_API_KEY di file .env';
-  }
+async function askGeminiWithKey(keyIndex, chatId, userMessage, systemInstructionText, pastHistory) {
+  const genAI = getGenAI(keyIndex);
+  if (!genAI) return null; // key tidak tersedia
 
   const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+
+  // Buat chat session baru dengan history + system instruction
+  const chatSession = model.startChat({
+    history: pastHistory,
+    generationConfig: { maxOutputTokens: 2048, temperature: 0.7 },
+    systemInstruction: {
+      role: 'user',
+      parts: [{ text: systemInstructionText }]
+    }
+  });
+
+  const result = await chatSession.sendMessage(userMessage);
+  // Simpan chat session supaya history berlanjut
+  chatHistories[chatId] = chatSession;
+  return result.response.text();
+}
+
+async function askAI(chatId, userMessage, assignmentsObj, courses, onStream) {
+  initGeminiKeys();
+  if (GEMINI_KEYS.length === 0) {
+    return 'Gemini API Key belum dikonfigurasi. Tambahkan GEMINI_API_KEY di file .env';
+  }
 
   let tugasContext = '';
   if (courses && courses.length > 0) {
@@ -275,40 +304,40 @@ async function askAI(chatId, userMessage, assignmentsObj, courses, onStream) {
     '6. Akhiri pesan dengan sapaan hangat atau semangat memotivasi! 🚀\n\n' +
     tugasContext;
 
-  // Selalu inisiasi ulang startChat dengan systemInstruction terbaru (yg berisi tugas aktif)
-  chatHistories[chatId] = model.startChat({
-    history: pastHistory,
-    generationConfig: { maxOutputTokens: 2048, temperature: 0.7 },
-    systemInstruction: {
-      role: 'user',
-      parts: [{ text: systemInstructionText }]
-    }
-  });
-
-  try {
-    const result = await chatHistories[chatId].sendMessage(userMessage);
-    return result.response.text();
-  } catch (err) {
-    const errMsg = err.message ? err.message.toLowerCase() : '';
-    if (errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted')) {
-      console.warn('[AI] Gemini quota exhausted, trying Siputzx GLM-4...');
-      try {
-        return await askSiputzxGLM(chatId, userMessage, systemInstructionText, pastHistory, onStream);
-      } catch (errGlm) {
-        console.warn('[AI] Siputzx GLM-4 failed:', errGlm.message, 'falling back to OpenRouter (Qwen)...');
-        return await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory, onStream);
+  // ── Cascade Fallback: Gemini Key 1 → Gemini Key 2 → Siputz → OpenRouter ──
+  for (let keyIdx = 0; keyIdx < GEMINI_KEYS.length; keyIdx++) {
+    try {
+      const keyLabel = keyIdx === 0 ? 'Primary' : 'Backup-' + keyIdx;
+      console.log(`[AI] Trying Gemini ${keyLabel} (key ${keyIdx + 1}/${GEMINI_KEYS.length})...`);
+      const answer = await askGeminiWithKey(keyIdx, chatId, userMessage, systemInstructionText, pastHistory);
+      if (answer) return answer;
+    } catch (err) {
+      const errMsg = err.message ? err.message.toLowerCase() : '';
+      const isQuotaError = errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted') || errMsg.includes('resource_exhausted');
+      if (isQuotaError) {
+        console.warn(`[AI] Gemini key ${keyIdx + 1} quota habis, mencoba key berikutnya...`);
+        continue; // coba key Gemini berikutnya
       }
+      // Error non-quota → langsung throw
+      throw err;
     }
-    throw err;
+  }
+
+  // Semua key Gemini habis → fallback ke Siputz GPT OSS
+  console.warn('[AI] Semua Gemini key habis. Trying Siputzx GPT OSS...');
+  try {
+    return await askSiputzxGLM(chatId, userMessage, systemInstructionText, pastHistory, onStream);
+  } catch (errGlm) {
+    console.warn('[AI] Siputzx GPT OSS failed:', errGlm.message, 'falling back to OpenRouter (Qwen)...');
+    return await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory, onStream);
   }
 }
 
 // ─── Ringkas Tugas dengan AI ──────────────────────────────────────────────────
 async function ringkasAssignment(assignment, onStream) {
-  const genAI = getGenAI();
-  if (!genAI) return 'GEMINI_API_KEY belum dikonfigurasi.';
+  initGeminiKeys();
+  if (GEMINI_KEYS.length === 0) return 'GEMINI_API_KEY belum dikonfigurasi.';
 
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
   const prompt =
     'Tolong ringkas tugas kuliah berikut dalam 3-5 poin singkat dan jelas. ' +
     'Jelaskan apa yang harus dikerjakan tanpa menggunakan format markdown yang berlebihan.\n\n' +
@@ -316,21 +345,32 @@ async function ringkasAssignment(assignment, onStream) {
     'Mata Kuliah: ' + assignment.courseName + '\n' +
     'Deskripsi: ' + (assignment.description || '(tidak ada deskripsi)');
 
-  try {
-    const result = await model.generateContent(prompt);
-    return result.response.text();
-  } catch (err) {
-    const errMsg = err.message ? err.message.toLowerCase() : '';
-    if (errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted')) {
-      console.warn('[AI] Gemini quota exhausted during summary, trying Siputzx GLM-4...');
-      try {
-        return await askSiputzxGLM('ringkas', prompt, 'Kamu adalah AI asisten asisten akademik yang ahli merangkum.', [], onStream);
-      } catch (errGlm) {
-        console.warn('[AI] Siputzx GLM-4 failed:', errGlm.message, 'falling back to OpenRouter (Qwen)...');
-        return await askOpenRouter('ringkas', prompt, 'Kamu adalah AI asisten asisten akademik yang ahli merangkum.', [], onStream);
+  // ── Cascade: Gemini Key 1 → Key 2 → Siputz → OpenRouter ──
+  for (let keyIdx = 0; keyIdx < GEMINI_KEYS.length; keyIdx++) {
+    try {
+      const genAI = getGenAI(keyIdx);
+      if (!genAI) continue;
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      const result = await model.generateContent(prompt);
+      return result.response.text();
+    } catch (err) {
+      const errMsg = err.message ? err.message.toLowerCase() : '';
+      const isQuotaError = errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted') || errMsg.includes('resource_exhausted');
+      if (isQuotaError) {
+        console.warn(`[AI] Gemini key ${keyIdx + 1} quota habis (ringkas), mencoba key berikutnya...`);
+        continue;
       }
+      throw err;
     }
-    throw err;
+  }
+
+  // Semua key Gemini habis → fallback
+  console.warn('[AI] Semua Gemini key habis (ringkas). Trying Siputzx GPT OSS...');
+  try {
+    return await askSiputzxGLM('ringkas', prompt, 'Kamu adalah AI asisten akademik yang ahli merangkum.', [], onStream);
+  } catch (errGlm) {
+    console.warn('[AI] Siputzx GPT OSS failed:', errGlm.message, 'falling back to OpenRouter (Qwen)...');
+    return await askOpenRouter('ringkas', prompt, 'Kamu adalah AI asisten akademik yang ahli merangkum.', [], onStream);
   }
 }
 
