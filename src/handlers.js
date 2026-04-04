@@ -294,14 +294,13 @@ async function askAI(chatId, userMessage, assignmentsObj, courses, onStream) {
   // Ambil history chat sebelumnya (jika ada) supaya konteks obrolan tidak hilang
   const pastHistory = chatHistories[chatId] ? await chatHistories[chatId].getHistory() : [];
 
-  const systemInstructionText = 'Kamu adalah Orion, asisten AI pribadi yang cerdas, ramah, dan proaktif mendampingi pemilikmu dalam perkuliahan.\n\n' +
-    'Instruksi Gaya Bahasa & Formatting (SANGAT PENTING):\n' +
-    '1. Gunakan gaya bahasa yang bersahabat, hangat, dan suportif (layaknya sahabat belajar terbaik).\n' +
-    '2. ✨ SELALU gunakan emoji yang menarik dan bervariasi di setiap kalimat atau daftar untuk mempercantik pesan.\n' +
-    '3. 📌 Jika menyebutkan daftar tugas atau materi, WAJIB gunakan bullet points atau daftar bernomor agar terlihat rapi dan elegan.\n' +
-    '4. Berikan spasi (enter/baris baru) antar paragraf supaya tidak sumpek dibaca di layar HP.\n' +
-    '5. Gunakan *huruf tebal (bold)* bebas untuk menebalkan judul tugas/mata kuliah, tetapi HINDARI _italic_ dan format markdown yang bertumpuk agar tidak memicu error parsing Telegram.\n' +
-    '6. Akhiri pesan dengan sapaan hangat atau semangat memotivasi! 🚀\n\n' +
+  const systemInstructionText = 'Kamu adalah Orion, asisten AI pribadi mahasiswa yang cerdas dan asik.\n\n' +
+    'Instruksi Gaya Bahasa (SANGAT PENTING - HEMAT TOKEN):\n' +
+    '1. Balas dengan SANGAT SINGKAT, langsung ke intinya (to the point). JANGAN buat paragraf atau penjelasan yang panjang lebar.\n' +
+    '2. Gunakan gaya bahasa santai, gaul, layaknya ngobrol sama teman (pakai "aku" dan sapa "kak"). JANGAN kaku, puitis, atau terlalu formal.\n' +
+    '3. JANGAN mengulang pertanyaan pengguna atau memutar-mutar kalimat (hindari basa-basi panjang yang membuang token).\n' +
+    '4. Sisipkan 1-2 emoji saja secukupnya agar estetik, tidak perlu berlebihan.\n' +
+    '5. Gunakan *huruf tebal (bold)* untuk poin penting, hindari format markdown rumit yang rawan error di Telegram.\n\n' +
     tugasContext;
 
   // ── Cascade Fallback: Gemini Key 1 → Gemini Key 2 → Siputz → OpenRouter ──
@@ -857,6 +856,40 @@ function register(bot) {
     await ctx.reply('\uD83C\uDFE0 Kembali ke menu utama.', mainMenuKeyboard);
   });
 
+  // ─── Agentic Web Automation ────────────────────────────────
+  bot.command('browse', async function(ctx) {
+    const text = ctx.message.text;
+    const parts = text.split(' ');
+    if (parts.length < 3) {
+      return ctx.reply('Format salah!\nGunakan: /browse <URL> <Instruksi>\n\nContoh: /browse https://google.com cari berita tentang AI terbaru');
+    }
+    
+    const url = parts[1];
+    if (!url.startsWith('http')) return ctx.reply('URL harus diawali dengan http:// atau https://');
+    
+    const instruction = parts.slice(2).join(' ');
+    
+    const loadingMsg = await ctx.reply('🚀 Menjalankan Orion Web Agent...\n\nTarget: ' + url + '\nMisi: ' + instruction);
+    
+    try {
+      const { executeAgenticTask } = require('./agenticBrowser');
+      await executeAgenticTask(
+        url,
+        instruction,
+        async (progressText) => {
+          await safeEdit(ctx, loadingMsg.message_id, `🤖 *Web Agent Status:*\n${progressText}`, { parse_mode: 'Markdown' });
+        },
+        async (screenshotBuffer, caption) => {
+          if (screenshotBuffer) {
+            await ctx.replyWithPhoto({ source: screenshotBuffer }, { caption, parse_mode: 'Markdown' }).catch(() => {});
+          }
+        }
+      );
+    } catch (err) {
+      await safeEdit(ctx, loadingMsg.message_id, `❌ *Agent Error:*\n${err.message}`, { parse_mode: 'Markdown' });
+    }
+  });
+
   // ─── Handler Pesan Teks Umum ──────────────────────────────────────────────
   bot.on('text', async function(ctx) {
     const chatId = ctx.chat.id;
@@ -1067,6 +1100,7 @@ function register(bot) {
     { command: 'kumpulkan', description: 'Kumpul tugas dengan upload file' },
     { command: 'mapel', description: 'Lihat mata kuliah yang aktif' },
     { command: 'ai', description: 'Nyalakan Asisten Orion AI' },
+    { command: 'browse', description: 'Minta AI menjelajahi / automasi website apa saja' },
     { command: 'refresh', description: 'Perbarui data terbaru dari Google Classroom' },
     { command: 'login', description: 'Login atau hubungkan akun Google' },
     { command: 'help', description: 'Panduan penggunaan bot' }
