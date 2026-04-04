@@ -87,6 +87,29 @@ npm run dev
 
 ---
 
+## 💻 Panduan Khusus Windows 7 / 8 / 10
+
+Jika Anda menggunakan Windows versi lama (Windows 10 kebawah) dan mengalami masalah saat instalasi atau menjalankan fitur **Absen ETHOL**, ikuti langkah berikut untuk memastikan kompatibilitas `puppeteer-core`:
+
+1. Hapus versi yang ada (jika ada):
+   ```bash
+   npm uninstall puppeteer-core
+   ```
+
+2. Install versi stabil yang kompatibel dengan Windows lama:
+   ```bash
+   npm install puppeteer-core@19.7.0 --save-exact
+   ```
+
+3. Verifikasi instalasi:
+   ```bash
+   npm list puppeteer-core
+   ```
+
+> 💡 **Tips:** Pastikan Anda sudah memiliki Google Chrome atau Microsoft Edge terinstal di sistem Anda. Orion akan otomatis mendeteksi lokasi browser tersebut.
+
+---
+
 ## 📁 Struktur Project
 
 ```

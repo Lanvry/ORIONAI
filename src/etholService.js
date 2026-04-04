@@ -87,25 +87,68 @@ async function loginAndCheckEthol(email, password, onProgress, mode = 'scan', ta
   console.log(`[ETHOL] Menggunakan browser: ${executablePath}`);
   if (onProgress) onProgress(`🌐 Membuka browser (${path.basename(executablePath)})...`);
 
+  // Baca konfigurasi headless dari .env (HEADLESS=false untuk debug visual)
+  // Default: true (headless) untuk production
+  const isHeadless = process.env.HEADLESS !== 'false';
+  console.log(`[ETHOL] Mode headless: ${isHeadless}`);
+
+  const browserArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    // PENTING: bypass SSL expired/untrusted cert — sangat penting di Windows 8
+    // karena root certificate store Windows 8 sudah outdated untuk banyak HTTPS site
+    '--ignore-certificate-errors',
+    '--ignore-ssl-errors',
+    '--ignore-certificate-errors-spki-list',
+    '--allow-insecure-localhost',
+    '--disable-web-security',
+    // Networking
+    '--disable-background-networking',
+    '--disable-sync',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-translate',
+    '--disable-infobars',
+    '--window-size=1280,800',
+  ];
+
+  // Hanya tambahkan disable-gpu jika headless=true (kalau false, GPU perlu jalan)
+  if (isHeadless) {
+    browserArgs.push('--disable-gpu', '--disable-software-rasterizer');
+  }
+
   const browser = await puppeteer.launch({
-    headless: true, // Ubah ke false jika ingin melihat UI saat debugging di PC lokal
+    headless: isHeadless,
     executablePath: executablePath,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--window-size=1280,800',
-    ],
-    defaultViewport: { width: 1280, height: 800 }
+    args: browserArgs,
+    defaultViewport: { width: 1280, height: 800 },
+    timeout: 60000,  // 60 detik timeout launch
   });
-  
+
   const page = await browser.newPage();
   const logs = [];
 
+  // Set timeout global navigasi 60 detik (default Puppeteer 30 detik terlalu pendek)
+  page.setDefaultNavigationTimeout(60000);
+  page.setDefaultTimeout(60000);
+
   try {
     if (onProgress) onProgress('🌐 Menuju portal login PENS (CAS)...');
-    await page.goto('https://login.pens.ac.id/cas/login?service=http%3A%2F%2Fethol.pens.ac.id%2Fcas%2F', { waitUntil: 'networkidle2', timeout: 20000 });
+    console.log('[ETHOL] Navigating to PENS CAS login...');
+
+    // Gunakan 'load' bukan 'networkidle2'!
+    // networkidle2 sering hang di portal yang terus-menerus polling network (AJAX)
+    // 'load' = tunggu sampai event 'load' browser, jauh lebih reliable & cepat
+    await page.goto(
+      'https://login.pens.ac.id/cas/login?service=http%3A%2F%2Fethol.pens.ac.id%2Fcas%2F',
+      { waitUntil: 'load', timeout: 45000 }
+    );
+    console.log('[ETHOL] Page loaded. URL:', page.url());
+    logs.push('Halaman login dimuat. URL: ' + page.url());
+
+    // Beri waktu extra supaya JS di halaman selesai render (Windows lama bisa lambat)
+    await new Promise(r => setTimeout(r, 1500));
 
     // Tunggu setidaknya ada satu input text/password muncul di halaman
     logs.push('Menunggu form login CAS muncul...');
