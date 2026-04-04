@@ -1,11 +1,102 @@
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core');
+const path = require('path');
+const fs = require('fs');
+
+/**
+ * Cari path executable Chrome/Edge yang sudah terinstall di sistem.
+ * Mendukung Windows 8, 10, 11 dan Linux/Mac.
+ * Priority: .env CHROME_PATH → Chrome → Edge → Brave → Chromium
+ */
+function findBrowserExecutable() {
+  // 1. Cek dari .env terlebih dahulu
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
+    return process.env.CHROME_PATH;
+  }
+
+  // 2. Candidate paths untuk Windows 8, 10, 11
+  const winPaths = [
+    // Google Chrome — lokasi umum
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
+    process.env.PROGRAMFILES + '\\Google\\Chrome\\Application\\chrome.exe',
+    // Microsoft Edge (bawaan Windows 10+, juga bisa di-install Windows 8)
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    process.env.LOCALAPPDATA + '\\Microsoft\\Edge\\Application\\msedge.exe',
+    // Brave Browser
+    'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+    'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+  ];
+
+  // 3. Candidate paths untuk Linux (untuk deployment di server)
+  const linuxPaths = [
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/snap/bin/chromium',
+    '/usr/bin/microsoft-edge',
+    '/usr/bin/brave-browser',
+  ];
+
+  // 4. Candidate paths untuk macOS
+  const macPaths = [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+  ];
+
+  const candidates = process.platform === 'win32' ? winPaths
+    : process.platform === 'darwin' ? macPaths
+    : linuxPaths;
+
+  for (const candidate of candidates) {
+    try {
+      if (candidate && fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch (_) {
+      // skip path yang tidak valid
+    }
+  }
+
+  return null;
+}
+
 
 async function loginAndCheckEthol(email, password, onProgress, mode = 'scan', targetCourse = null, onScreenshot = null) {
   if (onProgress) onProgress('Memulai eksekusi rahasia Puppeteer...');
-  
+
+  // Auto-detect browser yang terinstall (Chrome / Edge / Brave)
+  const executablePath = findBrowserExecutable();
+  if (!executablePath) {
+    return {
+      success: false,
+      error: '❌ Browser tidak ditemukan di sistem ini!\n\n' +
+        'Puppeteer membutuhkan Google Chrome, Microsoft Edge, atau Brave Browser.\n\n' +
+        '💡 Solusi:\n' +
+        '1. Install Google Chrome dari https://www.google.com/chrome\n' +
+        '   (Tersedia untuk Windows 7/8/10/11)\n\n' +
+        '2. ATAU tambahkan path browser ke file .env:\n' +
+        '   CHROME_PATH=C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe',
+      logs: [],
+    };
+  }
+
+  console.log(`[ETHOL] Menggunakan browser: ${executablePath}`);
+  if (onProgress) onProgress(`🌐 Membuka browser (${path.basename(executablePath)})...`);
+
   const browser = await puppeteer.launch({
     headless: true, // Ubah ke false jika ingin melihat UI saat debugging di PC lokal
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800'],
+    executablePath: executablePath,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--window-size=1280,800',
+    ],
     defaultViewport: { width: 1280, height: 800 }
   });
   
