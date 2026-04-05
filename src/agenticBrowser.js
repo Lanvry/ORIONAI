@@ -64,15 +64,17 @@ async function executeAgenticTask(url, instruction, onProgress, onSnapshot) {
   if (onProgress) onProgress(`🧭 Menavigasi ke: ${url}`);
   await page.goto(url, { waitUntil: 'load' }).catch(()=>{});
 
-  // Get API key
-  const apiKey = process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY_2;
-  if (!apiKey) {
+  // Ambil API key
+  const apiKeyMain = process.env.GEMINI_API_KEY;
+  const apiKeyBackup = process.env.GEMINI_API_KEY_2;
+  
+  if (!apiKeyMain && !apiKeyBackup) {
     await browser.close();
     throw new Error('GEMINI_API_KEY tidak ditemukan.');
   }
 
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', generationConfig: { temperature: 0.2, responseMimeType: "application/json" } });
+  let genAI = new GoogleGenerativeAI(apiKeyMain || apiKeyBackup);
+  let model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', generationConfig: { temperature: 0.2, responseMimeType: "application/json" } });
 
   let stepCount = 0;
   const MAX_STEPS = 10;
@@ -143,15 +145,39 @@ VISIBLE ELEMENTS:\n${JSON.stringify(elementsInfo, null, 2)}`;
 
     try {
       if (onProgress) onProgress(`🧠 Gemini sedang berpikir tindakan selanjutnya...`);
-      const result = await model.generateContent({
-        contents: [{
-          role: 'user',
-          parts: [
-            { text: AGENT_SYSTEM_PROMPT + '\n\n' + stateDescription },
-            { inlineData: { data: screenshotBuffer.toString('base64'), mimeType: 'image/jpeg' } }
-          ]
-        }]
-      });
+
+      let result;
+      try {
+        result = await model.generateContent({
+          contents: [{
+            role: 'user',
+            parts: [
+              { text: AGENT_SYSTEM_PROMPT + '\n\n' + stateDescription },
+              { inlineData: { data: screenshotBuffer.toString('base64'), mimeType: 'image/jpeg' } }
+            ]
+          }]
+        });
+      } catch (geminiError) {
+        console.error(`[AI Error Utama] ${geminiError.message}`);
+        // Fallback jika API utama error
+        if (apiKeyMain && apiKeyBackup) {
+          if (onProgress) onProgress(`🔄 API utama gagal (${geminiError.message.substring(0, 30)}). Beralih ke Gemini Ke-2...`);
+          const genAIBackup = new GoogleGenerativeAI(apiKeyBackup);
+          const modelBackup = genAIBackup.getGenerativeModel({ model: 'gemini-2.5-flash', generationConfig: { temperature: 0.2, responseMimeType: "application/json" } });
+          
+          result = await modelBackup.generateContent({
+            contents: [{
+              role: 'user',
+              parts: [
+                { text: AGENT_SYSTEM_PROMPT + '\n\n' + stateDescription },
+                { inlineData: { data: screenshotBuffer.toString('base64'), mimeType: 'image/jpeg' } }
+              ]
+            }]
+          });
+        } else {
+          throw geminiError;
+        }
+      }
 
       let jsonResp = result.response.text().trim();
       if (jsonResp.startsWith('\`\`\`json')) {

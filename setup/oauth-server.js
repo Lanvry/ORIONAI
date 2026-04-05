@@ -22,7 +22,7 @@ function startOAuthServer() {
     const host = req.headers.host || 'localhost:3000';
     const parsedUrl = new URL(req.url, `http://${host}`);
 
-    if (parsedUrl.pathname === '/oauth/callback') {
+    if (parsedUrl.pathname.endsWith('/oauth/callback')) {
       const code = parsedUrl.searchParams.get('code');
 
       if (!code) {

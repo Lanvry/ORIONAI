@@ -169,6 +169,55 @@ async function getAllAssignments(userId) {
 }
 
 /**
+ * Ambil semua materi terbaru dari semua kelas aktif.
+ * Membatasi hanya untuk materi yang dibuat atau diupdate dalam 7 hari terakhir.
+ */
+async function getAllRecentMaterials(userId) {
+  const courses = await getCourses(userId);
+  const materialsList = [];
+  const now = new Date();
+  
+  const auth = await getAuthenticatedClient(userId);
+  if (!auth) return [];
+  const classroom = google.classroom({ version: 'v1', auth });
+
+  await Promise.all(courses.map(async (course) => {
+    try {
+      const res = await classroom.courses.courseWorkMaterials.list({
+        courseId: course.id
+      });
+      const materials = res.data.courseWorkMaterial || [];
+
+      for (const mat of materials) {
+        if (mat.creationTime) {
+          const createdAt = new Date(mat.creationTime);
+          const diffDays = (now - createdAt) / (1000 * 60 * 60 * 24);
+          if (diffDays <= 7) {
+            materialsList.push({
+              courseId: course.id,
+              courseName: course.name,
+              materialId: mat.id,
+              title: mat.title,
+              description: mat.description || '',
+              alternateLink: mat.alternateLink,
+              creationTime: mat.creationTime,
+              materials: mat.materials || [] // <--- attachments (driveFile, link, youtubeVideo)
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[Classroom] Gagal ambil courseWorkMaterials untuk user ${userId} course ${course.name}: ${err.message}`);
+    }
+  }));
+
+  // Sort dari yang paling lama dibuat ke terbaru untuk notifikasi
+  materialsList.sort((a, b) => new Date(a.creationTime) - new Date(b.creationTime));
+
+  return materialsList;
+}
+
+/**
  * Pertahankan fungsi lama untuk kompatibilitas dengan cronJobs
  */
 async function getPendingAssignments(userId) {
@@ -228,13 +277,35 @@ async function submitAssignment(userId, courseId, courseWorkId, submissionId, fi
   return fileLink;
 }
 
+/**
+ * Download file asli dari Google Drive pengguna
+ */
+async function downloadDriveFile(userId, fileId, targetPath) {
+  const auth = await getAuthenticatedClient(userId);
+  if (!auth) throw new Error('Belum login Google.');
+  const drive = google.drive({ version: 'v3', auth });
+  
+  const fs = require('fs');
+  const dest = fs.createWriteStream(targetPath);
+  
+  const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+  return new Promise((resolve, reject) => {
+    res.data
+      .on('end', () => resolve(targetPath))
+      .on('error', err => reject(err))
+      .pipe(dest);
+  });
+}
+
 module.exports = {
   getCourses,
   getCourseWork,
   getMySubmission,
   getAllAssignments,
+  getAllRecentMaterials,
   getPendingAssignments,
   refreshAssignments,
   submitAssignment,
+  downloadDriveFile,
   invalidateCache,
 };

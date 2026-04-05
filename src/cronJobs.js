@@ -1,9 +1,11 @@
 const cron = require('node-cron');
-const { getPendingAssignments, refreshAssignments } = require('./classroomService');
+const { getPendingAssignments, refreshAssignments, getAllRecentMaterials, downloadDriveFile } = require('./classroomService');
 const { isAuthenticated } = require('./googleAuth');
 const { formatAssignmentMessage, formatAssignmentList, urgencyEmoji } = require('./utils');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 // Simpan daftar tugas yang sudah dikirim notifikasi per user (hindari duplikat)
 const notifiedAssignments = new Set();
@@ -81,7 +83,85 @@ async function checkAndNotify() {
         }
       }
     } catch (err) {
-      console.error(`[CronJob Error ${userId}]`, err.message);
+      console.error(`[CronJob Error Assignments ${userId}]`, err.message);
+    }
+
+    try {
+      const materials = await getAllRecentMaterials(userId);
+      for (const mat of materials) {
+        const matKey = `${userId}_materi_${mat.materialId}`;
+        if (!notifiedAssignments.has(matKey)) {
+           notifiedAssignments.add(matKey);
+           
+           let msg = `🎓 *MATERI BARU DITAMBAHKAN*\n\n`;
+           msg += `📚 *Mata Kuliah:* ${mat.courseName}\n`;
+           msg += `📖 *Materi:* ${mat.title}\n`;
+           if (mat.description) msg += `📝 *Deskripsi:* ${mat.description.substring(0, 150)}...\n`;
+           if (mat.alternateLink) msg += `\n🔗 [Buka di Classroom](${mat.alternateLink})\n`;
+           
+           // Kirim info utama materi
+           await global.bot.telegram.sendMessage(userId, msg, { parse_mode: 'Markdown', disable_web_page_preview: true });
+           
+           // Urus lampiran (jika ada) dan siapkan file path untuk AI
+           let aiFilePath = null;
+           let aiMimeType = null;
+           
+           if (mat.materials && mat.materials.length > 0) {
+             for (const item of mat.materials) {
+                if (item.driveFile && item.driveFile.driveFile) {
+                   const file = item.driveFile.driveFile;
+                   // Filter file besar & dokumen Google native (seperti Google Docs)
+                   if (!file.mimeType.includes('vnd.google-apps')) {
+                      const tempPath = path.join(os.tmpdir(), (file.title || 'lampiran').replace(/[/\\?%*:|"<>]/g, '-'));
+                      try {
+                        const downloaded = await downloadDriveFile(userId, file.id, tempPath);
+                        await global.bot.telegram.sendDocument(userId, { source: downloaded }, { caption: `📎 ${file.title}` });
+                        
+                        // Simpan 1 file PDF untuk dianalisa AI (yang pertama saja)
+                        if (!aiFilePath && file.mimeType.includes('pdf')) {
+                           // Copy file dulu sebelum link dihapus untuk diolah AI
+                           const aiPathCopy = tempPath + '_ai.pdf';
+                           fs.copyFileSync(downloaded, aiPathCopy);
+                           aiFilePath = aiPathCopy;
+                           aiMimeType = file.mimeType;
+                        }
+                        
+                        fs.unlinkSync(downloaded); // Clean up temp file
+                      } catch (e) {
+                        console.error(`Gagal download lampiran ${file.title}:`, e.message);
+                        await global.bot.telegram.sendMessage(userId, `📎 *Tautan Lampiran:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
+                      }
+                   } else {
+                      await global.bot.telegram.sendMessage(userId, `📎 *Dokumen Google:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
+                   }
+                }
+                
+                if (item.link) {
+                   await global.bot.telegram.sendMessage(userId, `🔗 *Tautan Luar:* [${item.link.title}](${item.link.url})`, { parse_mode: 'Markdown' });
+                }
+                if (item.youtubeVideo) {
+                   await global.bot.telegram.sendMessage(userId, `📺 *YouTube:* [${item.youtubeVideo.title}](${item.youtubeVideo.alternateLink})`, { parse_mode: 'Markdown' });
+                }
+             }
+           }
+
+           // Buat Summary AI
+           try {
+             const aiSum = await getAiMaterialSummary(mat.title, mat.description, aiFilePath, aiMimeType);
+             if (aiSum) {
+               await global.bot.telegram.sendMessage(userId, `🤖 *Pemahaman AI:*\n\n${aiSum}`, { parse_mode: 'Markdown' });
+             }
+           } catch (e) {
+             console.error('AI error memahami materi:', e.message);
+           }
+           
+           if (aiFilePath && fs.existsSync(aiFilePath)) {
+              fs.unlinkSync(aiFilePath);
+           }
+        }
+      }
+    } catch (err) {
+      console.error(`[CronJob Error Materials ${userId}]`, err.message);
     }
   }
 }
@@ -172,8 +252,46 @@ function start() {
     timezone: process.env.TIMEZONE || 'Asia/Jakarta',
   });
 
-  // Jalankan cek pertama saat startup (delay 5 detik)
   setTimeout(checkAndNotify, 5000);
+}
+
+async function getAiMaterialSummary(title, desc, filePath, mimeType) {
+  const apiKeyMain = process.env.GEMINI_API_KEY;
+  const apiKeyBackup = process.env.GEMINI_API_KEY_2;
+  const apiKey = apiKeyMain || apiKeyBackup;
+  if (!apiKey) return null;
+  
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' }); // pake 1.5 flash krn lebih bagus muat PDF document 
+    
+    let parts = [
+      { text: `Kamu adalah asisten pengingat materi kelas universitas yang bergaul dan asik menyapa. 
+Tolong pahami materi kelas ini.
+Judul Materi: ${title}
+Deskripsi: ${desc || 'Tidak ada deskripsi'}
+Tugasmu: Jelaskan secara singkat (maksimal 3 kalimat pendek santai) apa yang pada dasarnya dibahas di materi ini dan apa yang harus dipelajari.` }
+    ];
+    
+    // Jika ada file terlampir dan ukurannya < 5MB (untuk safety loading file)
+    if (filePath && fs.existsSync(filePath) && fs.statSync(filePath).size < 5 * 1024 * 1024) { 
+       if (mimeType.includes('pdf')) {
+           const fileData = fs.readFileSync(filePath);
+           parts.push({
+             inlineData: {
+               data: fileData.toString('base64'),
+               mimeType: 'application/pdf'
+             }
+           });
+       }
+    }
+    
+    const result = await model.generateContent(parts);
+    return result.response.text().trim();
+  } catch (e) {
+    console.error('AI Summary Error:', e.message);
+    return null;
+  }
 }
 
 module.exports = { start, checkAndNotify, sendDailyDigest };
