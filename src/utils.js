@@ -100,16 +100,20 @@ function formatAssignmentDetail(a) {
     ? '\n\n📝 *Deskripsi:*\n' + escapeMd(a.description)
     : '\n\n📝 *Deskripsi:* _(tidak ada)_';
 
+  const attachStr = formatAttachments(a.materials);
+
   return (
     urgencyEmoji(a.dueDate) + ' *DETAIL TUGAS*\n\n' +
     '📌 *Judul:* ' + escapeMd(a.title) + '\n' +
     '📚 *Mata Kuliah:* ' + escapeMd(a.courseName) + '\n' +
     '⏰ *Deadline:* ' + deadlineStr + '\n' +
     '⌛ *Sisa Waktu:* ' + formatTimeRemaining(a.dueDate) +
-    desc + '\n\n' +
+    desc +
+    attachStr + '\n\n' +
     '🔗 [Buka di Classroom](' + a.alternateLink + ')'
   );
 }
+
 
 /**
  * Format daftar tugas dengan penomoran dan indikator urgensi (Markdown V1 safe)

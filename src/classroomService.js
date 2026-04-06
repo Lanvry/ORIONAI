@@ -142,7 +142,9 @@ async function getAllAssignments(userId) {
         alternateLink: cw.alternateLink,
         submissionId: submission ? submission.id : null,
         submissionState: state || 'NEW',
+        materials: cw.materials || [],
       };
+
 
       if (isFinished) {
         finished.push(item);
