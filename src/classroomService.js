@@ -234,47 +234,91 @@ async function refreshAssignments(userId) {
 }
 
 /**
- * Upload file ke Google Drive dan attach ke submission, lalu Turn In
+ * Upload satu file ke Google Drive (TANPA attach/turn in)
  */
-async function submitAssignment(userId, courseId, courseWorkId, submissionId, filePath, fileName, mimeType) {
+async function uploadFileToDrive(userId, filePath, fileName, mimeType) {
   const auth = await getAuthenticatedClient(userId);
   if (!auth) throw new Error('Belum login Google.');
-
-  const classroom = google.classroom({ version: 'v1', auth });
   const drive = google.drive({ version: 'v3', auth });
   const fs = require('fs');
 
-  // 1. Upload ke Drive
   const driveRes = await drive.files.create({
     requestBody: { name: fileName, mimeType },
     media: { mimeType, body: fs.createReadStream(filePath) },
-    fields: 'id, webViewLink',
+    fields: 'id, webViewLink, name',
   });
 
-  const fileId = driveRes.data.id;
-  const fileLink = driveRes.data.webViewLink;
+  return {
+    fileId: driveRes.data.id,
+    fileLink: driveRes.data.webViewLink,
+    fileName: driveRes.data.name,
+  };
+}
 
-  // 2. Attach drive file ke submission
-  await classroom.courses.courseWork.studentSubmissions.modifyAttachments({
-    courseId,
-    courseWorkId,
-    id: submissionId,
-    requestBody: {
-      addAttachments: [{ driveFile: { id: fileId } }],
-    },
-  });
+/**
+ * Attach semua driveFileIds ke submission lalu Turn In.
+ * Jika gagal karena ProjectPermissionDenied (tugas dibuat guru via UI),
+ * kembalikan info upload saja — user harus manual Turn In di Classroom.
+ */
+async function finalizeSubmission(userId, courseId, courseWorkId, submissionId, driveFiles) {
+  const auth = await getAuthenticatedClient(userId);
+  if (!auth) throw new Error('Belum login Google.');
+  const classroom = google.classroom({ version: 'v1', auth });
 
-  // 3. Turn In
-  await classroom.courses.courseWork.studentSubmissions.turnIn({
-    courseId,
-    courseWorkId,
-    id: submissionId,
-  });
+  try {
+    // Attach semua file sekaligus
+    await classroom.courses.courseWork.studentSubmissions.modifyAttachments({
+      courseId,
+      courseWorkId,
+      id: submissionId,
+      requestBody: {
+        addAttachments: driveFiles.map(f => ({ driveFile: { id: f.fileId } })),
+      },
+    });
+  } catch (err) {
+    const isPermDenied = err.message && (
+      err.message.includes('ProjectPermissionDenied') ||
+      err.message.includes('PERMISSION_DENIED') ||
+      err.message.includes('insufficient authentication scopes')
+    );
+    if (isPermDenied) {
+      // Tidak bisa attach sama sekali - hanya Drive
+      return { attached: false, turnedIn: false, permissionDenied: true };
+    }
+    throw err;
+  }
 
-  // Invalidate cache setelah submit
-  invalidateCache(userId);
+  // File berhasil di-attach ke submission. Sekarang coba Turn In.
+  try {
+    await classroom.courses.courseWork.studentSubmissions.turnIn({
+      courseId,
+      courseWorkId,
+      id: submissionId,
+    });
+    invalidateCache(userId);
+    return { attached: true, turnedIn: true };
+  } catch (err) {
+    const isPermDenied = err.message && (
+      err.message.includes('ProjectPermissionDenied') ||
+      err.message.includes('PERMISSION_DENIED') ||
+      err.message.includes('insufficient authentication scopes')
+    );
+    if (isPermDenied) {
+      // File sudah attached tapi Turn In gagal - user tinggal klik Serahkan
+      invalidateCache(userId);
+      return { attached: true, turnedIn: false, permissionDenied: true };
+    }
+    throw err;
+  }
+}
 
-  return fileLink;
+/**
+ * Upload file ke Google Drive dan attach ke submission, lalu Turn In (legacy single-file)
+ */
+async function submitAssignment(userId, courseId, courseWorkId, submissionId, filePath, fileName, mimeType) {
+  const upload = await uploadFileToDrive(userId, filePath, fileName, mimeType);
+  await finalizeSubmission(userId, courseId, courseWorkId, submissionId, [upload]);
+  return upload.fileLink;
 }
 
 /**
@@ -371,6 +415,8 @@ module.exports = {
   getPendingAssignments,
   refreshAssignments,
   submitAssignment,
+  uploadFileToDrive,
+  finalizeSubmission,
   downloadDriveFile,
   invalidateCache,
   getCourseStream,

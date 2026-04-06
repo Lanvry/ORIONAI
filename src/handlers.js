@@ -3,6 +3,8 @@ const {
   getPendingAssignments,
   refreshAssignments,
   submitAssignment,
+  uploadFileToDrive,
+  finalizeSubmission,
   getCourses,
   getCourseStream,
 } = require('./classroomService');
@@ -891,6 +893,106 @@ function register(bot) {
     await ctx.reply('\uD83C\uDFE0 Kembali ke menu utama.', mainMenuKeyboard);
   });
 
+  // Tombol konfirmasi kumpulkan multi-file
+  bot.hears('\u2705 Kumpulkan', async function(ctx) {
+    const chatId = ctx.chat.id;
+    const userId = ctx.from.id;
+    const state = userState[chatId];
+
+    if (!state || state.step !== 'WAIT_FILE') {
+      return ctx.reply('Tidak ada tugas yang sedang dalam antrian pengumpulan.');
+    }
+
+    const assignment = state.selectedAssignment;
+    const pendingFiles = state.pendingFiles || [];
+
+    if (!pendingFiles.length) {
+      return ctx.reply('⚠️ Belum ada file yang dikirim! Kirim file terlebih dahulu lalu tekan Kumpulkan.');
+    }
+
+    const statusMsg = await ctx.reply(`📤 Mengupload ${pendingFiles.length} file ke Google Drive...`, { reply_markup: { remove_keyboard: true } });
+
+    (async () => {
+      const tempPaths = [];
+      try {
+        const uploadedFiles = [];
+        
+        for (let i = 0; i < pendingFiles.length; i++) {
+          const { fileId, fileName, mimeType } = pendingFiles[i];
+          await safeEdit(ctx, statusMsg.message_id, `📤 Mengupload file ${i + 1}/${pendingFiles.length}: ${fileName}...`);
+          const tempPath = await downloadTelegramFile(fileId, `${Date.now()}_${fileName}`);
+          tempPaths.push(tempPath);
+          const uploaded = await uploadFileToDrive(userId, tempPath, fileName, mimeType);
+          uploadedFiles.push(uploaded);
+        }
+
+        await safeEdit(ctx, statusMsg.message_id, '📤 Menghubungkan ke Classroom...');
+        const result = await finalizeSubmission(userId, assignment.courseId, assignment.courseWorkId, assignment.submissionId, uploadedFiles);
+
+        // Cleanup temp files
+        for (const p of tempPaths) {
+          try { fs.unlinkSync(p); } catch (e) {}
+        }
+        delete userState[chatId];
+
+        const fileLinks = uploadedFiles.map((f, i) => `${i + 1}. [${escapeMd(f.fileName)}](${f.fileLink})`).join('\n');
+
+        if (result && result.attached && !result.turnedIn) {
+          // File terlampir ke Classroom tapi Turn In gagal – user cukup klik Serahkan
+          await safeEdit(ctx, statusMsg.message_id, '\u2705 File terlampir! Tinggal klik Serahkan.');
+          await ctx.reply(
+            '\u2705 *File berhasil dilampirkan ke tugas Classroom!*\n\n' +
+            '\ud83d\udccc *Tugas:* ' + escapeMd(assignment.title) + '\n' +
+            '\ud83d\udcda *Mapel:* ' + escapeMd(assignment.courseName) + '\n\n' +
+            '\ud83d\udcce *File terlampir:*\n' + fileLinks + '\n\n' +
+            '\ud83d\udd14 *Satu langkah terakhir:*\n' +
+            'File sudah ada di halaman tugasmu. Buka dan klik *Serahkan*:\n\n' +
+            '\ud83d\udd17 [Buka Tugas & Klik Serahkan](' + assignment.alternateLink + ')',
+            { parse_mode: 'Markdown', disable_web_page_preview: true }
+          );
+        } else if (result && !result.attached) {
+          // modifyAttachments juga gagal – file hanya di Drive
+          await safeEdit(ctx, statusMsg.message_id, '\u26a0\ufe0f File di Drive. Perlu add manual ke Classroom.');
+          await ctx.reply(
+            '\u26a0\ufe0f *File berhasil diupload ke Google Drive!*\n\n' +
+            '\ud83d\udccc *Tugas:* ' + escapeMd(assignment.title) + '\n' +
+            '\ud83d\udcda *Mapel:* ' + escapeMd(assignment.courseName) + '\n\n' +
+            '\ud83d\udcce *File di Drive (klik untuk buka):*\n' + fileLinks + '\n\n' +
+            '\ud83d\udd14 *Cara attach ke Classroom:*\n' +
+            '1. Buka tugas di Classroom (link bawah)\n' +
+            '2. Klik *Tambahkan atau buat* \u2192 *Google Drive*\n' +
+            '3. Pilih file yang sudah diupload tadi\n' +
+            '4. Klik *Serahkan*\n\n' +
+            '\ud83d\udd17 [Buka Tugas di Classroom](' + assignment.alternateLink + ')',
+            { parse_mode: 'Markdown', disable_web_page_preview: true }
+          );
+        } else {
+          // Fully submitted!
+          await safeEdit(ctx, statusMsg.message_id, '\u2705 Tugas berhasil dikumpulkan!');
+          await ctx.reply(
+            '\u2705 *Tugas berhasil dikumpulkan!*\n\n' +
+            '\ud83d\udccc *Tugas:* ' + escapeMd(assignment.title) + '\n' +
+            '\ud83d\udcda *Mapel:* ' + escapeMd(assignment.courseName) + '\n\n' +
+            '\ud83d\udcce *File yang dikumpulkan:*\n' + fileLinks,
+            { parse_mode: 'Markdown', disable_web_page_preview: true }
+          );
+        }
+
+        await ctx.reply('Kembali ke menu utama:', mainMenuKeyboard);
+      } catch (err) {
+        for (const p of tempPaths) {
+          try { fs.unlinkSync(p); } catch (e) {}
+        }
+        await safeEdit(ctx, statusMsg.message_id, '❌ Gagal mengupload.');
+        await ctx.reply('❌ Gagal mengumpulkan tugas:\n' + err.message);
+        await ctx.reply('Kembali ke menu utama:', mainMenuKeyboard);
+        delete userState[chatId];
+      }
+    })();
+  });
+
+
+
   // ─── Agentic Web Automation ────────────────────────────────
   bot.command('browse', async function(ctx) {
     const text = ctx.message.text;
@@ -1014,12 +1116,13 @@ function register(bot) {
         const idx = parseInt(match[1]) - 1;
         const selected = state.assignments[idx];
         if (selected) {
-          userState[chatId] = { step: 'WAIT_FILE', selectedAssignment: selected };
+      userState[chatId] = { step: 'WAIT_FILE', selectedAssignment: selected, pendingFiles: [] };
           await ctx.reply(
-            '\uD83D\uDCCE Siap! Kirim file untuk tugas:\n\n' +
-            selected.title + '\n' + selected.courseName + '\n\n' +
-            '(Kirim file sebagai lampiran/dokumen, foto, atau video)',
-            { reply_markup: { keyboard: [['\u274C Batal']], resize_keyboard: true } }
+            '📎 Siap! Kirim file untuk tugas:\n\n' +
+            '*' + selected.title + '*\n' + selected.courseName + '\n\n' +
+            '💡 Kamu bisa kirim lebih dari 1 file.\n' +
+            'Tekan *✅ Kumpulkan* jika sudah selesai mengirim semua file.',
+            { parse_mode: 'Markdown', reply_markup: { keyboard: [['\u2705 Kumpulkan'], ['\u274C Batal']], resize_keyboard: true } }
           );
           return;
         }
@@ -1096,39 +1199,47 @@ function register(bot) {
     const userId = ctx.from.id;
     const state = userState[chatId];
 
-    // Jika sedang dalam proses mengumpulkan tugas, proses pengumpulan
-    if (state && (state.step === 'WAIT_FILE' || state.step === 'SELECT_ASSIGNMENT_FOR_UPLOAD')) {
+    // Jika sedang dalam proses WAIT_FILE: tampung file, tunggu konfirmasi
+    if (state && state.step === 'WAIT_FILE') {
       if (!isAuthenticated(userId)) {
         return ctx.reply('Untuk mengumpulkan file ke Classroom, kamu harus Login Google terlebih dahulu.');
       }
-      
       const assignment = state.selectedAssignment;
-      
-      if (!assignment) {
-         return ctx.reply('Silakan pilih tugas dari menu Kumpulkan Tugas terlebih dahulu.');
+      if (!assignment) return ctx.reply('Silakan pilih tugas dari menu Kumpulkan Tugas terlebih dahulu.');
+      if (!assignment.submissionId) return ctx.reply('Tidak ada submission ID. Pastikan kamu sudah terdaftar di mata kuliah ini.');
+
+      // Tampung file di state
+      if (!state.pendingFiles) state.pendingFiles = [];
+      state.pendingFiles.push({ fileId, fileName, mimeType });
+
+      const count = state.pendingFiles.length;
+      await ctx.reply(
+        `✅ File ke-${count} diterima: *${fileName}*\n\n` +
+        `Total ${count} file menunggu.\n` +
+        `Kirim file lagi atau tekan *✅ Kumpulkan* untuk mengumpulkan sekarang!`,
+        { parse_mode: 'Markdown', reply_markup: { keyboard: [['\u2705 Kumpulkan'], ['\u274C Batal']], resize_keyboard: true } }
+      );
+      return;
+    }
+
+    // Jika sedang SELECT_ASSIGNMENT_FOR_UPLOAD (legacy flow)
+    if (state && state.step === 'SELECT_ASSIGNMENT_FOR_UPLOAD') {
+      if (!isAuthenticated(userId)) {
+        return ctx.reply('Untuk mengumpulkan file ke Classroom, kamu harus Login Google terlebih dahulu.');
       }
+      const assignment = state.selectedAssignment;
+      if (!assignment) return ctx.reply('Silakan pilih tugas dari menu Kumpulkan Tugas terlebih dahulu.');
+      if (!assignment.submissionId) return ctx.reply('Tidak ada submission ID. Pastikan kamu sudah terdaftar di mata kuliah ini.');
 
-      if (!assignment.submissionId) {
-        return ctx.reply('Tidak ada submission ID. Pastikan kamu sudah terdaftar di mata kuliah ini.');
-      }
+      if (!state.pendingFiles) state.pendingFiles = [];
+      state.pendingFiles.push({ fileId, fileName, mimeType });
+      userState[chatId] = { step: 'WAIT_FILE', selectedAssignment: assignment, pendingFiles: state.pendingFiles };
 
-      const statusMsg = await ctx.reply('\uD83D\uDCE4 Mengupload ke Google Drive...');
-
-      try {
-        const tempPath = await downloadTelegramFile(fileId, fileName);
-        await safeEdit(ctx, statusMsg.message_id, '\uD83D\uDCE4 Mengumpulkan ke Classroom...');
-
-        const link = await submitAssignment(userId, assignment.courseId, assignment.courseWorkId, assignment.submissionId, tempPath, fileName, mimeType);
-
-        try { fs.unlinkSync(tempPath); } catch (e) {}
-        delete userState[chatId];
-
-        await safeEdit(ctx, statusMsg.message_id, '\u2705 Tugas berhasil dikumpulkan!\n\nTugas: ' + assignment.title + '\nMapel: ' + assignment.courseName + '\nFile: ' + fileName);
-        await ctx.reply('Kembali ke menu utama:', mainMenuKeyboard);
-      } catch (err) {
-        try { fs.unlinkSync(path.join(os.tmpdir(), fileName)); } catch (e) {}
-        await safeEdit(ctx, statusMsg.message_id, 'Gagal mengumpulkan tugas: ' + err.message);
-      }
+      const count = state.pendingFiles.length;
+      await ctx.reply(
+        `✅ File ke-${count} diterima: *${fileName}*\n\nTotal ${count} file menunggu.\nTekan *✅ Kumpulkan* untuk mengumpulkan sekarang!`,
+        { parse_mode: 'Markdown', reply_markup: { keyboard: [['\u2705 Kumpulkan'], ['\u274C Batal']], resize_keyboard: true } }
+      );
       return;
     }
 
