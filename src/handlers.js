@@ -4,6 +4,7 @@ const {
   refreshAssignments,
   submitAssignment,
   getCourses,
+  getCourseStream,
 } = require('./classroomService');
 const {
   formatAssignmentList,
@@ -11,6 +12,7 @@ const {
   formatAssignmentDetail,
   getMimeType,
   escapeMd,
+  formatStreamItemDetail,
 } = require('./utils');
 const { saveCredentials, getCredentials, deleteCredentials, hasCredentials } = require('./etholCredentials');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -399,6 +401,7 @@ const mainMenuKeyboard = {
       [{ text: '\uD83D\uDCCB Daftar Tugas' }, { text: '\uD83D\uDD17 Login Google' }],
       [{ text: '\u2705 Kumpulkan Tugas' }, { text: '\uD83E\uDD16 Tanya AI' }],
       [{ text: '\uD83D\uDCDA Daftar Mapel' }, { text: '\uD83C\uDF93 Absen ETHOL' }],
+      [{ text: '📖 Lihat Materi' }],
       [{ text: '\u2753 Bantuan' }, { text: '\u274C Tutup Menu' }]
     ],
     resize_keyboard: true,
@@ -786,6 +789,38 @@ function register(bot) {
     })();
   });
 
+  // ─── Flow Lihat Materi ──────────────────────────────────────────────────
+  bot.hears(['📖 Lihat Materi', '/materi'], async function(ctx) {
+    const userId = ctx.from.id;
+    const chatId = ctx.chat.id;
+    if (!isAuthenticated(userId)) {
+      return ctx.reply('Kamu belum login Google. Tekan Login Google terlebih dahulu.');
+    }
+    const loadingMsg = await ctx.reply('⏳ Memuat daftar mata kuliah...');
+    try {
+      const courses = await getCourses(userId);
+      if (!courses.length) {
+         return safeEdit(ctx, loadingMsg.message_id, 'Tidak ada mata kuliah aktif.');
+      }
+      
+      userState[chatId] = { step: 'SELECT_MATERI_COURSE', courses: courses };
+      const buttons = courses.map((c, i) => [`${i + 1}. ${c.name}`]);
+      buttons.push(['\u274C Batal']);
+      
+      await ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+      await ctx.reply('📚 *PILIH MATA KULIAH*', {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          keyboard: buttons,
+          resize_keyboard: true,
+          one_time_keyboard: true
+        }
+      });
+    } catch (err) {
+      await safeEdit(ctx, loadingMsg.message_id, 'Error: ' + err.message);
+    }
+  });
+
   // Daftar Mapel
   bot.hears(['\uD83D\uDCDA Daftar Mapel', '/mapel'], async function(ctx) {
     const userId = ctx.from.id;
@@ -896,6 +931,81 @@ function register(bot) {
     const userId = ctx.from.id;
     const text = ctx.message.text;
     const state = userState[chatId];
+    
+    if (text === '❌ Batal' || text === '\u274C Batal') {
+       delete userState[chatId];
+       await ctx.reply('Kembali ke menu utama.', mainMenuKeyboard);
+       return;
+    }
+
+    if (state && state.step === 'SELECT_MATERI_COURSE') {
+      const match = text.match(/^(\d+)\./);
+      if (match) {
+        const idx = parseInt(match[1]) - 1;
+        const selected = state.courses[idx];
+        if (selected) {
+          const loadingMsg = await ctx.reply('⏳ Memuat materi & tugas...', { reply_markup: { remove_keyboard: true } });
+          try {
+            const stream = await getCourseStream(userId, selected.id);
+            if (!stream.length) {
+               await safeEdit(ctx, loadingMsg.message_id, 'Belum ada materi atau tugas di kelas ini.');
+               userState[chatId] = undefined;
+               return ctx.reply('Kembali ke menu utama.', mainMenuKeyboard);
+            }
+            
+            userState[chatId] = { step: 'SELECT_MATERI_ITEM', courseId: selected.id, stream: stream };
+            const buttons = stream.map((s, i) => {
+              const icon = s.type === 'ASSIGNMENT' ? '📝' : '📖';
+              const titleText = (s.title || 'Tanpa Judul').substring(0, 30);
+              return [`${i + 1}. ${icon} ${titleText}...`];
+            });
+            buttons.push(['\u274C Batal']); // \u274C Batal
+            
+            await ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+            return ctx.reply(`📚 *STREAM KELAS (15 TERBARU)*\nPilih materi/tugas untuk melihat detail:`, {
+              parse_mode: 'Markdown',
+              reply_markup: { keyboard: buttons, resize_keyboard: true, one_time_keyboard: true }
+            });
+          } catch (err) {
+             await safeEdit(ctx, loadingMsg.message_id, 'Gagal memuat materi: ' + err.message);
+             userState[chatId] = undefined;
+             return ctx.reply('Kembali ke menu utama.', mainMenuKeyboard);
+          }
+        }
+      }
+      return ctx.reply('Pilihan tidak valid. Ketik nomor mata kuliah yang sesuai.', {
+        reply_markup: {
+          keyboard: state.courses.map((c, i) => [`${i + 1}. ${c.name}`]).concat([['\u274C Batal']]),
+          resize_keyboard: true,
+          one_time_keyboard: true
+        }
+      });
+    }
+
+    if (state && state.step === 'SELECT_MATERI_ITEM') {
+      const match = text.match(/^(\d+)\./);
+      if (match) {
+        const idx = parseInt(match[1]) - 1;
+        const selected = state.stream[idx];
+        if (selected) {
+          try {
+            const itemDetailStr = formatStreamItemDetail(selected);
+            await ctx.reply(itemDetailStr, { parse_mode: 'Markdown', disable_web_page_preview: true });
+            delete userState[chatId];
+            return ctx.reply('Kembali ke menu utama.', mainMenuKeyboard);
+          } catch (err) {
+            return ctx.reply('Gagal memuat detail item: ' + err.message);
+          }
+        }
+      }
+      return ctx.reply('Pilihan tidak valid. Ketik nomor tugas yang sesuai.', {
+        reply_markup: {
+          keyboard: state.stream.map((s, i) => [`${i + 1}. ${s.type === 'ASSIGNMENT' ? '📝' : '📖'} ${(s.title || 'Tanpa Judul').substring(0, 30)}...`]).concat([['\u274C Batal']]),
+          resize_keyboard: true,
+          one_time_keyboard: true
+        }
+      });
+    }
 
     // ... (State codes untu PILIH TUGAS)
     if (state && state.step === 'SELECT_ASSIGNMENT') {

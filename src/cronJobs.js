@@ -111,14 +111,14 @@ async function checkAndNotify() {
                 if (item.driveFile && item.driveFile.driveFile) {
                    const file = item.driveFile.driveFile;
                    // Filter file besar & dokumen Google native (seperti Google Docs)
-                   if (!file.mimeType.includes('vnd.google-apps')) {
+                   if (file.mimeType && !file.mimeType.includes('vnd.google-apps')) {
                       const tempPath = path.join(os.tmpdir(), (file.title || 'lampiran').replace(/[/\\?%*:|"<>]/g, '-'));
                       try {
                         const downloaded = await downloadDriveFile(userId, file.id, tempPath);
                         await global.bot.telegram.sendDocument(userId, { source: downloaded }, { caption: `📎 ${file.title}` });
                         
                         // Simpan 1 file PDF untuk dianalisa AI (yang pertama saja)
-                        if (!aiFilePath && file.mimeType.includes('pdf')) {
+                        if (!aiFilePath && file.mimeType && file.mimeType.includes('pdf')) {
                            // Copy file dulu sebelum link dihapus untuk diolah AI
                            const aiPathCopy = tempPath + '_ai.pdf';
                            fs.copyFileSync(downloaded, aiPathCopy);
@@ -131,8 +131,10 @@ async function checkAndNotify() {
                         console.error(`Gagal download lampiran ${file.title}:`, e.message);
                         await global.bot.telegram.sendMessage(userId, `📎 *Tautan Lampiran:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
                       }
-                   } else {
+                   } else if (file.mimeType) {
                       await global.bot.telegram.sendMessage(userId, `📎 *Dokumen Google:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
+                   } else {
+                      await global.bot.telegram.sendMessage(userId, `📎 *Tautan Lampiran:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
                    }
                 }
                 

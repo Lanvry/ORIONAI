@@ -297,6 +297,71 @@ async function downloadDriveFile(userId, fileId, targetPath) {
   });
 }
 
+/**
+ * Mengambil stream (tugas + materi) dari sebuah kelas
+ */
+async function getCourseStream(userId, courseId) {
+  const auth = await getAuthenticatedClient(userId);
+  if (!auth) throw new Error('Belum login Google.');
+  const classroom = google.classroom({ version: 'v1', auth });
+
+  const stream = [];
+
+  // Hit courseWork (Tugas)
+  try {
+    const cwRes = await classroom.courses.courseWork.list({
+      courseId,
+      orderBy: 'updateTime desc',
+      pageSize: 20
+    });
+    const cws = cwRes.data.courseWork || [];
+    for (const cw of cws) {
+      stream.push({
+        id: cw.id,
+        type: 'ASSIGNMENT',
+        title: cw.title,
+        description: cw.description || '',
+        creationTime: cw.creationTime,
+        updateTime: cw.updateTime,
+        alternateLink: cw.alternateLink,
+        materials: cw.materials || [],
+        dueDate: cw.dueDate || null,
+        dueTime: cw.dueTime || null
+      });
+    }
+  } catch (e) {
+    console.warn(`[Classroom] Gagal fetch courseWork stream:`, e.message);
+  }
+
+  // Hit courseWorkMaterials (Materi)
+  try {
+    const matRes = await classroom.courses.courseWorkMaterials.list({
+      courseId,
+      pageSize: 20
+    }); 
+    const mats = matRes.data.courseWorkMaterial || [];
+    for (const mat of mats) {
+      stream.push({
+        id: mat.id,
+        type: 'MATERIAL',
+        title: mat.title,
+        description: mat.description || '',
+        creationTime: mat.creationTime,
+        updateTime: mat.updateTime,
+        alternateLink: mat.alternateLink,
+        materials: mat.materials || []
+      });
+    }
+  } catch (e) {
+    console.warn(`[Classroom] Gagal fetch materials stream:`, e.message);
+  }
+
+  // Sort Descending by updateTime
+  stream.sort((a, b) => new Date(b.updateTime) - new Date(a.updateTime));
+
+  return stream.slice(0, 15); // Ambil 15 terbaru
+}
+
 module.exports = {
   getCourses,
   getCourseWork,
@@ -308,4 +373,5 @@ module.exports = {
   submitAssignment,
   downloadDriveFile,
   invalidateCache,
+  getCourseStream,
 };

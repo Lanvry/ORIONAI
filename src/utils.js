@@ -192,6 +192,75 @@ function getMimeType(filename) {
   return mimeMap[ext] || 'application/octet-stream';
 }
 
+/**
+ * Format string untuk daftar lampiran
+ */
+function formatAttachments(materials) {
+  if (!materials || materials.length === 0) return '';
+  let str = '\n\n📎 *Lampiran:*\n';
+  materials.forEach((mat, i) => {
+    if (mat.driveFile && mat.driveFile.driveFile) {
+      str += `${i + 1}. 📄 [${escapeMd(mat.driveFile.driveFile.title)}](${mat.driveFile.driveFile.alternateLink})\n`;
+    } else if (mat.youtubeVideo) {
+      str += `${i + 1}. 🎥 [${escapeMd(mat.youtubeVideo.title)}](${mat.youtubeVideo.alternateLink})\n`;
+    } else if (mat.link) {
+      str += `${i + 1}. 🔗 [${escapeMd(mat.link.title)}](${mat.link.url})\n`;
+    } else if (mat.form) {
+      str += `${i + 1}. 📝 [${escapeMd(mat.form.title)}](${mat.form.formUrl})\n`;
+    }
+  });
+  return str;
+}
+
+/**
+ * Format detail item stream (Assignment atau Material)
+ */
+function formatStreamItemDetail(item) {
+  const isAssignment = item.type === 'ASSIGNMENT';
+  const typeIcon = isAssignment ? '📝' : '📖';
+  const typeText = isAssignment ? 'TUGAS' : 'MATERI';
+
+  let deadlineStr = '';
+  if (isAssignment) {
+    if (item.dueDate) {
+      const year = item.dueDate.year;
+      const month = item.dueDate.month - 1;
+      const day = item.dueDate.day;
+      const hours = item.dueTime ? (item.dueTime.hours || 23) : 23;
+      const minutes = item.dueTime ? (item.dueTime.minutes || 59) : 59;
+      const dueObj = new Date(year, month, day, hours, minutes);
+      
+      deadlineStr = '\n⏰ *Deadline:* ' + dueObj.toLocaleString('id-ID', {
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      });
+      deadlineStr += '\n⌛ *Sisa Waktu:* ' + formatTimeRemaining(dueObj);
+    } else {
+      deadlineStr = '\n⏰ *Deadline:* Tidak ada deadline';
+    }
+  }
+
+  const descStr = item.description
+    ? '\n\n📝 *Deskripsi:*\n' + escapeMd(item.description)
+    : '\n\n📝 *Deskripsi:* _(tidak ada)_';
+
+  const attachStr = formatAttachments(item.materials);
+  
+  const updatedDate = new Date(item.updateTime).toLocaleString('id-ID', {
+    day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
+
+  return (
+    typeIcon + ' *DETAIL ' + typeText + '*\n\n' +
+    '📌 *Judul:* ' + escapeMd(item.title) + '\n' +
+    '🕒 *Diperbarui:* ' + updatedDate +
+    deadlineStr +
+    descStr +
+    attachStr + '\n\n' +
+    '🔗 [Buka di Classroom](' + item.alternateLink + ')'
+  );
+}
+
 module.exports = {
   formatAssignmentMessage,
   formatAssignmentDetail,
@@ -200,4 +269,6 @@ module.exports = {
   formatTimeRemaining,
   urgencyEmoji,
   escapeMd,
+  formatAttachments,
+  formatStreamItemDetail,
 };
