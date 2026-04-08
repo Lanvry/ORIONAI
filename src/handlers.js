@@ -403,7 +403,7 @@ const mainMenuKeyboard = {
       [{ text: '\uD83D\uDCCB Daftar Tugas' }, { text: '\uD83D\uDD17 Login Google' }],
       [{ text: '\u2705 Kumpulkan Tugas' }, { text: '\uD83E\uDD16 Tanya AI' }],
       [{ text: '\uD83D\uDCDA Daftar Mapel' }, { text: '\uD83C\uDF93 Absen ETHOL' }],
-      [{ text: '📖 Lihat Materi' }],
+      [{ text: '📖 Lihat Materi' }, { text: '📅 Lihat Jadwal' }],
       [{ text: '\u2753 Bantuan' }, { text: '\u274C Tutup Menu' }]
     ],
     resize_keyboard: true,
@@ -821,6 +821,55 @@ function register(bot) {
     } catch (err) {
       await safeEdit(ctx, loadingMsg.message_id, 'Error: ' + err.message);
     }
+  });
+
+  // ─── Flow Lihat Jadwal MIS PENS ─────────────────────────────────────────
+  bot.hears(['📅 Lihat Jadwal', '/jadwal'], async function(ctx) {
+    const userId = String(ctx.from.id);
+    const creds = getCredentials(userId);
+
+    if (!creds) {
+      return ctx.reply(
+        '⚠️ Kredensial belum disimpan.\n\nGunakan perintah /ethollogin untuk menyimpan email dan password secara aman (kredensial ini juga digunakan untuk MIS PENS).',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    const { email, password } = creds;
+    const loadingMsg = await ctx.reply('🚀 Membuka portal Akademik MIS PENS...', { parse_mode: 'Markdown' });
+
+    (async () => {
+      try {
+        const { getScheduleMis } = require('./misService');
+        
+        const result = await getScheduleMis(email, password, async (text) => {
+           await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
+        });
+
+        await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+
+        if (!result.success) {
+           let errMsg = `❌ *Gagal Scraping Jadwal:* ${result.error}`;
+           if (result.screenshot) {
+              await ctx.replyWithPhoto(
+                { source: result.screenshot },
+                { caption: errMsg, parse_mode: 'Markdown' }
+              );
+           } else {
+              await ctx.reply(errMsg, { parse_mode: 'Markdown' });
+           }
+           return;
+        }
+
+        await ctx.replyWithPhoto(
+          { source: result.screenshot },
+          { caption: '✅ *Jadwal Kuliah per-semester berhasil diambil!*', parse_mode: 'Markdown' }
+        );
+
+      } catch (err) {
+        await safeEdit(ctx, loadingMsg.message_id, 'Error Lihat Jadwal: ' + err.message);
+      }
+    })();
   });
 
   // Daftar Mapel
