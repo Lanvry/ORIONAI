@@ -25,7 +25,7 @@ function getAllUserIds() {
 /**
  * Kirim notifikasi ke semua user jika ada tugas baru / hampir deadline
  */
-async function checkAndNotify() {
+async function checkAndNotify(isFirstRun = false) {
   const userIds = getAllUserIds();
 
   for (const userId of userIds) {
@@ -40,14 +40,16 @@ async function checkAndNotify() {
         // Notifikasi tugas baru (belum pernah di-notify)
         if (!notifiedAssignments.has(key)) {
           notifiedAssignments.add(key);
-          try {
-            await global.bot.telegram.sendMessage(
-              userId,
-              formatAssignmentMessage(a, `🆕 *TUGAS BARU!*`),
-              { parse_mode: 'Markdown', disable_web_page_preview: true }
-            );
-          } catch (sendErr) {
-            console.error(`[CronJob] Gagal kirim notif tugas baru ke ${userId}:`, sendErr.message);
+          if (!isFirstRun) {
+            try {
+              await global.bot.telegram.sendMessage(
+                userId,
+                formatAssignmentMessage(a, `🆕 *TUGAS BARU!*`),
+                { parse_mode: 'Markdown', disable_web_page_preview: true }
+              );
+            } catch (sendErr) {
+              console.error(`[CronJob] Gagal kirim notif tugas baru ke ${userId}:`, sendErr.message);
+            }
           }
         }
 
@@ -58,28 +60,28 @@ async function checkAndNotify() {
         const key7 = `${key}_h7`;
         if (hoursDiff <= 168 && hoursDiff > 144 && !notifiedAssignments.has(key7)) {
           notifiedAssignments.add(key7);
-          await sendDeadlineWarning(userId, a, '🟡 *PERINGATAN — 7 HARI LAGI!*');
+          if (!isFirstRun) await sendDeadlineWarning(userId, a, '🟡 *PERINGATAN — 7 HARI LAGI!*');
         }
 
         // Peringatan H-3 (72 jam)
         const key3 = `${key}_h3`;
         if (hoursDiff <= 72 && hoursDiff > 48 && !notifiedAssignments.has(key3)) {
           notifiedAssignments.add(key3);
-          await sendDeadlineWarning(userId, a, '🟠 *PERINGATAN — 3 HARI LAGI!*');
+          if (!isFirstRun) await sendDeadlineWarning(userId, a, '🟠 *PERINGATAN — 3 HARI LAGI!*');
         }
 
         // Peringatan H-1 (24 jam)
         const key1 = `${key}_h1`;
         if (hoursDiff <= 24 && hoursDiff > 0 && !notifiedAssignments.has(key1)) {
           notifiedAssignments.add(key1);
-          await sendDeadlineWarning(userId, a, '🔴 *DEADLINE BESOK!*');
+          if (!isFirstRun) await sendDeadlineWarning(userId, a, '🔴 *DEADLINE BESOK!*');
         }
 
         // Peringatan 2 jam terakhir
         const key2h = `${key}_2h`;
         if (hoursDiff <= 2 && hoursDiff > 0 && !notifiedAssignments.has(key2h)) {
           notifiedAssignments.add(key2h);
-          await sendDeadlineWarning(userId, a, '🚨 *DEADLINE 2 JAM LAGI! SEGERA KUMPULKAN!*');
+          if (!isFirstRun) await sendDeadlineWarning(userId, a, '🚨 *DEADLINE 2 JAM LAGI! SEGERA KUMPULKAN!*');
         }
       }
     } catch (err) {
@@ -93,72 +95,74 @@ async function checkAndNotify() {
         if (!notifiedAssignments.has(matKey)) {
            notifiedAssignments.add(matKey);
            
-           let msg = `🎓 *MATERI BARU DITAMBAHKAN*\n\n`;
-           msg += `📚 *Mata Kuliah:* ${mat.courseName}\n`;
-           msg += `📖 *Materi:* ${mat.title}\n`;
-           if (mat.description) msg += `📝 *Deskripsi:* ${mat.description.substring(0, 150)}...\n`;
-           if (mat.alternateLink) msg += `\n🔗 [Buka di Classroom](${mat.alternateLink})\n`;
-           
-           // Kirim info utama materi
-           await global.bot.telegram.sendMessage(userId, msg, { parse_mode: 'Markdown', disable_web_page_preview: true });
-           
-           // Urus lampiran (jika ada) dan siapkan file path untuk AI
-           let aiFilePath = null;
-           let aiMimeType = null;
-           
-           if (mat.materials && mat.materials.length > 0) {
-             for (const item of mat.materials) {
-                if (item.driveFile && item.driveFile.driveFile) {
-                   const file = item.driveFile.driveFile;
-                   // Filter file besar & dokumen Google native (seperti Google Docs)
-                   if (file.mimeType && !file.mimeType.includes('vnd.google-apps')) {
-                      const tempPath = path.join(os.tmpdir(), (file.title || 'lampiran').replace(/[/\\?%*:|"<>]/g, '-'));
-                      try {
-                        const downloaded = await downloadDriveFile(userId, file.id, tempPath);
-                        await global.bot.telegram.sendDocument(userId, { source: downloaded }, { caption: `📎 ${file.title}` });
-                        
-                        // Simpan 1 file PDF untuk dianalisa AI (yang pertama saja)
-                        if (!aiFilePath && file.mimeType && file.mimeType.includes('pdf')) {
-                           // Copy file dulu sebelum link dihapus untuk diolah AI
-                           const aiPathCopy = tempPath + '_ai.pdf';
-                           fs.copyFileSync(downloaded, aiPathCopy);
-                           aiFilePath = aiPathCopy;
-                           aiMimeType = file.mimeType;
+           if (!isFirstRun) {
+             let msg = `🎓 *MATERI BARU DITAMBAHKAN*\n\n`;
+             msg += `📚 *Mata Kuliah:* ${mat.courseName}\n`;
+             msg += `📖 *Materi:* ${mat.title}\n`;
+             if (mat.description) msg += `📝 *Deskripsi:* ${mat.description.substring(0, 150)}...\n`;
+             if (mat.alternateLink) msg += `\n🔗 [Buka di Classroom](${mat.alternateLink})\n`;
+             
+             // Kirim info utama materi
+             await global.bot.telegram.sendMessage(userId, msg, { parse_mode: 'Markdown', disable_web_page_preview: true });
+             
+             // Urus lampiran (jika ada) dan siapkan file path untuk AI
+             let aiFilePath = null;
+             let aiMimeType = null;
+             
+             if (mat.materials && mat.materials.length > 0) {
+               for (const item of mat.materials) {
+                  if (item.driveFile && item.driveFile.driveFile) {
+                     const file = item.driveFile.driveFile;
+                     // Filter file besar & dokumen Google native (seperti Google Docs)
+                     if (file.mimeType && !file.mimeType.includes('vnd.google-apps')) {
+                        const tempPath = path.join(os.tmpdir(), (file.title || 'lampiran').replace(/[/\\?%*:|"<>]/g, '-'));
+                        try {
+                          const downloaded = await downloadDriveFile(userId, file.id, tempPath);
+                          await global.bot.telegram.sendDocument(userId, { source: downloaded }, { caption: `📎 ${file.title}` });
+                          
+                          // Simpan 1 file PDF untuk dianalisa AI (yang pertama saja)
+                          if (!aiFilePath && file.mimeType && file.mimeType.includes('pdf')) {
+                             // Copy file dulu sebelum link dihapus untuk diolah AI
+                             const aiPathCopy = tempPath + '_ai.pdf';
+                             fs.copyFileSync(downloaded, aiPathCopy);
+                             aiFilePath = aiPathCopy;
+                             aiMimeType = file.mimeType;
+                          }
+                          
+                          fs.unlinkSync(downloaded); // Clean up temp file
+                        } catch (e) {
+                          console.error(`Gagal download lampiran ${file.title}:`, e.message);
+                          await global.bot.telegram.sendMessage(userId, `📎 *Tautan Lampiran:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
                         }
-                        
-                        fs.unlinkSync(downloaded); // Clean up temp file
-                      } catch (e) {
-                        console.error(`Gagal download lampiran ${file.title}:`, e.message);
+                     } else if (file.mimeType) {
+                        await global.bot.telegram.sendMessage(userId, `📎 *Dokumen Google:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
+                     } else {
                         await global.bot.telegram.sendMessage(userId, `📎 *Tautan Lampiran:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
-                      }
-                   } else if (file.mimeType) {
-                      await global.bot.telegram.sendMessage(userId, `📎 *Dokumen Google:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
-                   } else {
-                      await global.bot.telegram.sendMessage(userId, `📎 *Tautan Lampiran:* [${file.title}](${file.alternateLink})`, { parse_mode: 'Markdown' });
-                   }
-                }
-                
-                if (item.link) {
-                   await global.bot.telegram.sendMessage(userId, `🔗 *Tautan Luar:* [${item.link.title}](${item.link.url})`, { parse_mode: 'Markdown' });
-                }
-                if (item.youtubeVideo) {
-                   await global.bot.telegram.sendMessage(userId, `📺 *YouTube:* [${item.youtubeVideo.title}](${item.youtubeVideo.alternateLink})`, { parse_mode: 'Markdown' });
-                }
+                     }
+                  }
+                  
+                  if (item.link) {
+                     await global.bot.telegram.sendMessage(userId, `🔗 *Tautan Luar:* [${item.link.title}](${item.link.url})`, { parse_mode: 'Markdown' });
+                  }
+                  if (item.youtubeVideo) {
+                     await global.bot.telegram.sendMessage(userId, `📺 *YouTube:* [${item.youtubeVideo.title}](${item.youtubeVideo.alternateLink})`, { parse_mode: 'Markdown' });
+                  }
+               }
              }
-           }
 
-           // Buat Summary AI
-           try {
-             const aiSum = await getAiMaterialSummary(mat.title, mat.description, aiFilePath, aiMimeType);
-             if (aiSum) {
-               await global.bot.telegram.sendMessage(userId, `🤖 *Pemahaman AI:*\n\n${aiSum}`, { parse_mode: 'Markdown' });
+             // Buat Summary AI
+             try {
+               const aiSum = await getAiMaterialSummary(mat.title, mat.description, aiFilePath, aiMimeType);
+               if (aiSum) {
+                 await global.bot.telegram.sendMessage(userId, `🤖 *Pemahaman AI:*\n\n${aiSum}`, { parse_mode: 'Markdown' });
+               }
+             } catch (e) {
+               console.error('AI error memahami materi:', e.message);
              }
-           } catch (e) {
-             console.error('AI error memahami materi:', e.message);
-           }
-           
-           if (aiFilePath && fs.existsSync(aiFilePath)) {
-              fs.unlinkSync(aiFilePath);
+             
+             if (aiFilePath && fs.existsSync(aiFilePath)) {
+                fs.unlinkSync(aiFilePath);
+             }
            }
         }
       }
@@ -247,14 +251,14 @@ function start() {
   console.log(`📬 Daily digest: setiap hari jam ${digestHour}:00 untuk semua user`);
 
   // Cek tugas berkala
-  cron.schedule(`*/${interval} * * * *`, checkAndNotify);
+  cron.schedule(`*/${interval} * * * *`, () => checkAndNotify(false));
 
   // Daily digest setiap pagi
   cron.schedule(`0 ${digestHour} * * *`, sendDailyDigest, {
     timezone: process.env.TIMEZONE || 'Asia/Jakarta',
   });
 
-  setTimeout(checkAndNotify, 5000);
+  setTimeout(() => checkAndNotify(true), 5000); // 👈 Sync diam-diam di awal
 }
 
 async function getAiMaterialSummary(title, desc, filePath, mimeType) {
