@@ -1,4 +1,4 @@
-const { getAuthUrl, saveToken, isAuthenticated } = require('./googleAuth');
+const { getAuthUrl, saveToken, isAuthenticated } = require('../googleAuth');
 const {
   getPendingAssignments,
   refreshAssignments,
@@ -7,7 +7,7 @@ const {
   finalizeSubmission,
   getCourses,
   getCourseStream,
-} = require('./classroomService');
+} = require('../classroomService');
 const {
   formatAssignmentList,
   formatAssignmentMessage,
@@ -15,8 +15,8 @@ const {
   getMimeType,
   escapeMd,
   formatStreamItemDetail,
-} = require('./utils');
-const { saveCredentials, getCredentials, deleteCredentials, hasCredentials } = require('./etholCredentials');
+} = require('../utils');
+const { saveCredentials, getCredentials, deleteCredentials, hasCredentials } = require('../etholCredentials');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 const fs = require('fs');
@@ -54,329 +54,7 @@ async function safeEdit(ctx, msgId, text, opts) {
 // ─── State Sementara Per User ─────────────────────────────────────────────────
 const userState = {}; // { [chatId]: { step, assignments, selectedAssignment } }
 
-// ─── AI Instance (Multi-Key Rotation) ─────────────────────────────────────────
-const GEMINI_KEYS = [];
-const genAIInstances = {};
-
-function initGeminiKeys() {
-  if (GEMINI_KEYS.length > 0) return;
-  if (process.env.GEMINI_API_KEY) GEMINI_KEYS.push(process.env.GEMINI_API_KEY);
-  if (process.env.GEMINI_API_KEY_2) GEMINI_KEYS.push(process.env.GEMINI_API_KEY_2);
-}
-
-function getGenAI(keyIndex = 0) {
-  initGeminiKeys();
-  if (keyIndex >= GEMINI_KEYS.length) return null;
-  const key = GEMINI_KEYS[keyIndex];
-  if (!genAIInstances[key]) {
-    genAIInstances[key] = new GoogleGenerativeAI(key);
-  }
-  return genAIInstances[key];
-}
-
-// ─── AI Chat & Fallback ─────────────────────────────────────────────
-const chatHistories = {};
-
-async function askSiputzxGLM(chatId, userParts, systemInstruction, pastHistory, onStream) {
-  let hasImage = false;
-  let textPrompt = '';
-  
-  if (typeof userParts === 'string') {
-    textPrompt = userParts;
-  } else if (Array.isArray(userParts)) {
-    for (const part of userParts) {
-      if (typeof part === 'string') textPrompt += part + '\n';
-      else if (part.text) textPrompt += part.text + '\n';
-      else if (part.inlineData) hasImage = true;
-    }
-  }
-
-  // Jika ada gambar, lempar error karena endpoint ini umumnya hanya teks GET param
-  if (hasImage) {
-    throw new Error('Siputzx GLM-4 tidak mendukung input gambar. Lanjut ke fallback berikutnya.');
-  }
-
-  let historyText = '';
-  if (pastHistory && pastHistory.length > 0) {
-    historyText += '--- RIWAYAT CHAT ---\n';
-    for (const msg of pastHistory) {
-      const role = msg.role === 'model' ? 'Orion' : 'User';
-      const partsText = msg.parts.map(p => p.text).join('\n');
-      historyText += `${role}: ${partsText}\n`;
-    }
-    historyText += '--------------------\n\n';
-  }
-  
-  const finalPrompt = historyText + 'User: ' + textPrompt;
-
-  const url = `https://api.siputzx.my.id/api/ai/gptoss120b?prompt=${encodeURIComponent(finalPrompt)}&system=${encodeURIComponent(systemInstruction)}&temperature=0.7`;
-
-  if (onStream) onStream('Waiting for response...');
-
-  const response = await axios.get(url, { timeout: 30000 });
-  
-  if (response.data && response.data.status === true && response.data.data && response.data.data.response) {
-    return response.data.data.response;
-  } else {
-    throw new Error('Respons tidak valid dari Siputzx.');
-  }
-}
-
-async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory, onStream) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error('API Key OpenRouter tidak ada (.env).');
-
-  const messages = [];
-  messages.push({ role: 'system', content: systemInstruction });
-
-  for (const msg of pastHistory) {
-    const role = msg.role === 'model' ? 'assistant' : 'user';
-    const textParts = msg.parts.map(p => p.text).join('\n');
-    messages.push({ role, content: textParts });
-  }
-
-  let hasImage = false;
-  let currentUserContent;
-  
-  if (typeof userParts === 'string') {
-    currentUserContent = userParts;
-  } else if (Array.isArray(userParts)) {
-    currentUserContent = [];
-    for (const part of userParts) {
-      if (typeof part === 'string') {
-        currentUserContent.push({ type: 'text', text: part });
-      } else if (part.text) {
-        currentUserContent.push({ type: 'text', text: part.text });
-      } else if (part.inlineData) {
-        hasImage = true;
-        currentUserContent.push({
-          type: 'image_url',
-          image_url: { url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}` }
-        });
-      }
-    }
-  }
-
-  messages.push({ role: 'user', content: currentUserContent });
-  const modelQuery = 'qwen/qwen3.6-plus:free';
-
-  try {
-    const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
-      model: process.env.OPENROUTER_MODEL || modelQuery,
-      messages: messages,
-      temperature: 0.7,
-      stream: true,
-    }, {
-      responseType: 'stream',
-      timeout: 60000,
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://github.com/Lanvry/ORIONAI',
-        'X-Title': 'Orion AI'
-      }
-    });
-
-    return new Promise((resolve, reject) => {
-      let fullText = '';
-      let lastEditTime = Date.now();
-      let partialChunk = '';
-
-      response.data.on('data', (chunk) => {
-        partialChunk += chunk.toString('utf8');
-        const lines = partialChunk.split('\n');
-        partialChunk = lines.pop() || ''; 
-
-        for (let line of lines) {
-          line = line.trim();
-          if (line === 'data: [DONE]') continue;
-          if (line.startsWith('data: ')) {
-            try {
-              const parsed = JSON.parse(line.slice(6));
-              if (parsed.choices && parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                fullText += parsed.choices[0].delta.content;
-              }
-            } catch (e) {
-              // Abaikan parse error per baris SSE
-            }
-          }
-        }
-
-        const now = Date.now();
-        // Update UI tiap 1500ms agar tidak over-limit API Telegram
-        if (now - lastEditTime > 1500) {
-          lastEditTime = now;
-          if (onStream && fullText) onStream(fullText);
-        }
-      });
-
-      response.data.on('end', () => resolve(fullText));
-      response.data.on('error', reject);
-    });
-  } catch (err) {
-    // Karena responseType='stream', error message biasanya tidak berupa JSON objek
-    const is429 = err.response && err.response.status === 429;
-    const retryCount = typeof this.retryCount === 'number' ? this.retryCount : 0;
-    
-    if (is429 && retryCount < 2) {
-      if (onStream) onStream('\u23F3 Server Qwen (OpenRouter) sedang penuh antrian (429). Mencoba ulang dalam 3 detik...');
-      await new Promise(r => setTimeout(r, 3000));
-      const boundFn = askOpenRouter.bind({ retryCount: retryCount + 1 });
-      return await boundFn(chatId, userParts, systemInstruction, pastHistory, onStream);
-    }
-    
-    let errMsg = err.message;
-    if (is429) {
-      errMsg = 'Terlalu banyak permintaan (Rate limit OpenRouter versi gratis tercapai). Silakan coba lagi nanti.';
-    }
-    throw new Error(`OpenRouter gagal: ${errMsg}`);
-  }
-}
-
-async function askGeminiWithKey(keyIndex, chatId, userMessage, systemInstructionText, pastHistory) {
-  const genAI = getGenAI(keyIndex);
-  if (!genAI) return null; // key tidak tersedia
-
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-
-  // Buat chat session baru dengan history + system instruction
-  const chatSession = model.startChat({
-    history: pastHistory,
-    generationConfig: { maxOutputTokens: 2048, temperature: 0.7 },
-    systemInstruction: {
-      role: 'user',
-      parts: [{ text: systemInstructionText }]
-    }
-  });
-
-  const result = await chatSession.sendMessage(userMessage);
-  // Simpan chat session supaya history berlanjut
-  chatHistories[chatId] = chatSession;
-  return result.response.text();
-}
-
-async function askAI(chatId, userMessage, assignmentsObj, courses, onStream) {
-  initGeminiKeys();
-  if (GEMINI_KEYS.length === 0) {
-    return 'Gemini API Key belum dikonfigurasi. Tambahkan GEMINI_API_KEY di file .env';
-  }
-
-  let tugasContext = '';
-  if (courses && courses.length > 0) {
-    tugasContext += '\n\n=== DAFTAR KELAS (COURSES) PEMILIK ===\n';
-    courses.forEach(function(c, i) {
-      tugasContext += (i + 1) + '. ' + c.name + (c.section ? ' (' + c.section + ')' : '') + '\n';
-    });
-  }
-
-  const pending = Array.isArray(assignmentsObj) ? assignmentsObj : assignmentsObj.pending || [];
-  const finished = Array.isArray(assignmentsObj) ? [] : assignmentsObj.finished || [];
-
-  if (pending.length > 0) {
-    tugasContext += '\n=== TUGAS AKTIF PENGGUNA (BELUM SELESAI) ===\n';
-    pending.slice(0, 10).forEach(function(a, i) {
-      const deadline = a.dueDate
-        ? a.dueDate.toLocaleString('id-ID', {
-            day: '2-digit', month: 'short', year: 'numeric',
-            hour: '2-digit', minute: '2-digit',
-          })
-        : 'Tanpa deadline';
-      tugasContext += (i + 1) + '. ' + a.title + ' (' + a.courseName + ') — Deadline: ' + deadline + '\n';
-      if (a.description) tugasContext += '   Deskripsi: ' + a.description.slice(0, 100) + '...\n';
-    });
-    tugasContext += '===========================\n';
-  }
-
-  if (finished.length > 0) {
-    tugasContext += '\n=== TUGAS SUDAH SELESAI PENGGUNA (RIWAYAT) ===\n';
-    finished.slice(0, 10).forEach(function(a, i) {
-      tugasContext += (i + 1) + '. ' + a.title + ' (' + a.courseName + ') — Sudah dikumpulkan/dinilai\n';
-    });
-    tugasContext += '===========================\n';
-  }
-
-  // Ambil history chat sebelumnya (jika ada) supaya konteks obrolan tidak hilang
-  const pastHistory = chatHistories[chatId] ? await chatHistories[chatId].getHistory() : [];
-
-  const systemInstructionText = 'Kamu adalah Orion, asisten AI pribadi mahasiswa yang cerdas dan asik.\n\n' +
-    'Instruksi Gaya Bahasa (SANGAT PENTING - HEMAT TOKEN):\n' +
-    '1. Balas dengan SANGAT SINGKAT, langsung ke intinya (to the point). JANGAN buat paragraf atau penjelasan yang panjang lebar.\n' +
-    '2. Gunakan gaya bahasa santai, gaul, layaknya ngobrol sama teman (pakai "aku" dan sapa "kak"). JANGAN kaku, puitis, atau terlalu formal.\n' +
-    '3. JANGAN mengulang pertanyaan pengguna atau memutar-mutar kalimat (hindari basa-basi panjang yang membuang token).\n' +
-    '4. Sisipkan 1-2 emoji saja secukupnya agar estetik, tidak perlu berlebihan.\n' +
-    '5. Gunakan *huruf tebal (bold)* untuk poin penting, hindari format markdown rumit yang rawan error di Telegram.\n\n' +
-    tugasContext;
-
-  // ── Cascade Fallback: Gemini Key 1 → Gemini Key 2 → Siputz → OpenRouter ──
-  for (let keyIdx = 0; keyIdx < GEMINI_KEYS.length; keyIdx++) {
-    try {
-      const keyLabel = keyIdx === 0 ? 'Primary' : 'Backup-' + keyIdx;
-      console.log(`[AI] Trying Gemini ${keyLabel} (key ${keyIdx + 1}/${GEMINI_KEYS.length})...`);
-      const answer = await askGeminiWithKey(keyIdx, chatId, userMessage, systemInstructionText, pastHistory);
-      if (answer) return answer;
-    } catch (err) {
-      const errMsg = err.message ? err.message.toLowerCase() : '';
-      const isQuotaError = errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted') || errMsg.includes('resource_exhausted');
-      if (isQuotaError) {
-        console.warn(`[AI] Gemini key ${keyIdx + 1} quota habis, mencoba key berikutnya...`);
-        continue; // coba key Gemini berikutnya
-      }
-      // Error non-quota → langsung throw
-      throw err;
-    }
-  }
-
-  // Semua key Gemini habis → fallback ke Siputz GPT OSS
-  console.warn('[AI] Semua Gemini key habis. Trying Siputzx GPT OSS...');
-  try {
-    return await askSiputzxGLM(chatId, userMessage, systemInstructionText, pastHistory, onStream);
-  } catch (errGlm) {
-    console.warn('[AI] Siputzx GPT OSS failed:', errGlm.message, 'falling back to OpenRouter (Qwen)...');
-    return await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory, onStream);
-  }
-}
-
-// ─── Ringkas Tugas dengan AI ──────────────────────────────────────────────────
-async function ringkasAssignment(assignment, onStream) {
-  initGeminiKeys();
-  if (GEMINI_KEYS.length === 0) return 'GEMINI_API_KEY belum dikonfigurasi.';
-
-  const prompt =
-    'Tolong ringkas tugas kuliah berikut dalam 3-5 poin singkat dan jelas. ' +
-    'Jelaskan apa yang harus dikerjakan tanpa menggunakan format markdown yang berlebihan.\n\n' +
-    'Judul: ' + assignment.title + '\n' +
-    'Mata Kuliah: ' + assignment.courseName + '\n' +
-    'Deskripsi: ' + (assignment.description || '(tidak ada deskripsi)');
-
-  // ── Cascade: Gemini Key 1 → Key 2 → Siputz → OpenRouter ──
-  for (let keyIdx = 0; keyIdx < GEMINI_KEYS.length; keyIdx++) {
-    try {
-      const genAI = getGenAI(keyIdx);
-      if (!genAI) continue;
-      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-      const result = await model.generateContent(prompt);
-      return result.response.text();
-    } catch (err) {
-      const errMsg = err.message ? err.message.toLowerCase() : '';
-      const isQuotaError = errMsg.includes('quota') || errMsg.includes('429') || errMsg.includes('exhausted') || errMsg.includes('resource_exhausted');
-      if (isQuotaError) {
-        console.warn(`[AI] Gemini key ${keyIdx + 1} quota habis (ringkas), mencoba key berikutnya...`);
-        continue;
-      }
-      throw err;
-    }
-  }
-
-  // Semua key Gemini habis → fallback
-  console.warn('[AI] Semua Gemini key habis (ringkas). Trying Siputzx GPT OSS...');
-  try {
-    return await askSiputzxGLM('ringkas', prompt, 'Kamu adalah AI asisten akademik yang ahli merangkum.', [], onStream);
-  } catch (errGlm) {
-    console.warn('[AI] Siputzx GPT OSS failed:', errGlm.message, 'falling back to OpenRouter (Qwen)...');
-    return await askOpenRouter('ringkas', prompt, 'Kamu adalah AI asisten akademik yang ahli merangkum.', [], onStream);
-  }
-}
-
+const { askAI, ringkasAssignment } = require('../aiService');
 // ─── Download File dari Telegram ─────────────────────────────────────────────
 async function downloadTelegramFile(fileId, fileName) {
   const bot = global.bot;
@@ -609,7 +287,7 @@ function register(bot) {
     }
     const loadingMsg = await ctx.reply('\uD83D\uDD04 Sedang mengambil data tugas dari Classroom...');
     try {
-      const { getAllAssignments } = require('./classroomService');
+      const { getAllAssignments } = require('../classroomService');
       const assignmentsObj = await getAllAssignments(userId);
       await safeEdit(ctx, loadingMsg.message_id, formatAssignmentList(assignmentsObj), { parse_mode: 'Markdown', disable_web_page_preview: true });
     } catch (err) {
@@ -686,7 +364,7 @@ function register(bot) {
 
     (async () => {
       try {
-        const { loginAndCheckEthol } = require('./etholService');
+        const { loginAndCheckEthol } = require('../etholService');
         
         const result = await loginAndCheckEthol(email, password, async (text) => {
           await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
@@ -742,7 +420,7 @@ function register(bot) {
 
     (async () => {
       try {
-        const { loginAndCheckEthol } = require('./etholService');
+        const { loginAndCheckEthol } = require('../etholService');
         
         const result = await loginAndCheckEthol(
           email, 
@@ -840,7 +518,7 @@ function register(bot) {
 
     (async () => {
       try {
-        const { getScheduleMis } = require('./misService');
+        const { getScheduleMis } = require('../misService');
         
         const result = await getScheduleMis(email, password, async (text) => {
            await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
@@ -1058,7 +736,7 @@ function register(bot) {
     const loadingMsg = await ctx.reply('🚀 Menjalankan Orion Web Agent...\n\nTarget: ' + url + '\nMisi: ' + instruction);
     
     try {
-      const { executeAgenticTask } = require('./agenticBrowser');
+      const { executeAgenticTask } = require('../agenticBrowser');
       await executeAgenticTask(
         url,
         instruction,
@@ -1205,14 +883,7 @@ function register(bot) {
       const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
       (async () => {
         try {
-          let assignmentsObj = { pending: [], finished: [] };
-          let courses = [];
-          if (isAuthenticated(userId)) {
-            const { getAllAssignments, getCourses } = require('./classroomService');
-            try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
-            try { courses = await getCourses(userId); } catch (e) {}
-          }
-          const answer = await askAI(chatId, text, assignmentsObj, courses, async (streamingText) => {
+          const answer = await askAI(chatId, text, [], [], async (streamingText) => {
             await safeEdit(ctx, thinking.message_id, streamingText + ' \u23F3', { parse_mode: 'Markdown' });
           });
           await safeEdit(ctx, thinking.message_id, answer, { parse_mode: 'Markdown' });
@@ -1226,14 +897,7 @@ function register(bot) {
     const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
     (async () => {
       try {
-        let assignmentsObj = { pending: [], finished: [] };
-        let courses = [];
-        if (isAuthenticated(userId)) {
-          const { getAllAssignments, getCourses } = require('./classroomService');
-          try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
-          try { courses = await getCourses(userId); } catch (e) {}
-        }
-        const answer = await askAI(chatId, text, assignmentsObj, courses, async (streamingText) => {
+        const answer = await askAI(chatId, text, [], [], async (streamingText) => {
           await safeEdit(ctx, thinking.message_id, streamingText + ' \u23F3', { parse_mode: 'Markdown' });
         });
         await safeEdit(ctx, thinking.message_id, answer, { parse_mode: 'Markdown' });
@@ -1303,7 +967,7 @@ function register(bot) {
         let assignmentsObj = { pending: [], finished: [] };
         let courses = [];
         if (isAuthenticated(userId)) {
-          const { getAllAssignments, getCourses } = require('./classroomService');
+          const { getAllAssignments, getCourses } = require('../classroomService');
           try { assignmentsObj = await getAllAssignments(userId); } catch (e) {}
           try { courses = await getCourses(userId); } catch (e) {}
         }

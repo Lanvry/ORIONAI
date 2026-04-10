@@ -269,7 +269,7 @@ async function getAiMaterialSummary(title, desc, filePath, mimeType) {
   
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' }); // pake 1.5 flash krn lebih bagus muat PDF document 
+    const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' }); // pake 1.5 flash krn lebih bagus muat PDF document 
     
     let parts = [
       { text: `Kamu adalah asisten pengingat materi kelas universitas yang bergaul dan asik menyapa. 

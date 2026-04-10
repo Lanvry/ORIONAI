@@ -16,6 +16,7 @@
     "@google/generative-ai": "^0.24.1",
     "axios": "^1.14.0",
     "chrome-finder": "^1.0.7",
+    "discord.js": "^14.26.2",
     "dotenv": "^17.4.0",
     "googleapis": "^171.4.0",
     "node-cron": "^4.2.1",
