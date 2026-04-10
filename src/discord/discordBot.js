@@ -3,6 +3,7 @@ const { askAI } = require('../aiService');
 const { getCredentials, saveCredentials } = require('../etholCredentials');
 const { loginAndCheckEthol } = require('../etholService');
 const { getScheduleMis } = require('../misService');
+const { agenticQueue } = require('../agenticQueue');
 
 const DISCORD_BOT_PERSONA = 'Kamu adalah bot representasi PENS Sumenep yang cerdas, ramah, dan asik. Kamu dihidupkan dengan sistem inti Orion AI. ' +
     'Instruksi Gaya Bahasa:\n' +
@@ -11,40 +12,7 @@ const DISCORD_BOT_PERSONA = 'Kamu adalah bot representasi PENS Sumenep yang cerd
     '3. Jika ditanya siapa kamu atau siapa pembuatmu, sebutkan bahwa kamu berjalan di atas platform Orion AI.\n' +
     '4. Sisipkan 1-2 emoji saja secukupnya.';
 
-// --- Antrian Sistem agar Memory Aman ---
-class AsyncQueue {
-    constructor() {
-        this.queue = [];
-        this.isProcessing = false;
-    }
-
-    async enqueue(taskFn) {
-        return new Promise((resolve, reject) => {
-            this.queue.push(async () => {
-                try {
-                    const result = await taskFn();
-                    resolve(result);
-                } catch (e) {
-                    reject(e);
-                }
-            });
-            this.process();
-        });
-    }
-
-    async process() {
-        if (this.isProcessing || this.queue.length === 0) return;
-        this.isProcessing = true;
-        const task = this.queue.shift();
-        try {
-            await task();
-        } finally {
-            this.isProcessing = false;
-            this.process();
-        }
-    }
-}
-const absenQueue = new AsyncQueue();
+// --- Antrian Sistem dihapus, pindah ke src/agenticQueue.js ---
 
 function startDiscordBot() {
   if (!process.env.DISCORD_BOT_TOKEN) {
@@ -99,23 +67,15 @@ function startDiscordBot() {
                 .addStringOption(option => option.setName('password').setDescription('Password ETHOL PENS').setRequired(true))
         ].map(i => i.toJSON());
 
-        console.log('🔄 Memaksa sinkronisasi Slash Commands ke setiap server secara instan...');
-        for (const [guildId, guild] of client.guilds.cache) {
-            try {
-                await rest.put(
-                    Routes.applicationGuildCommands(client.user.id, guildId),
-                    { body: commands }
-                );
-            } catch (err) {
-                console.warn(`⚠️ Gagal sinkronisasi di server [${guild.name}]: ${err.message}`);
-            }
-        }
-
+        // Daftarkan sebagai Global Commands saja agar konsisten di semua server dan DM.
+        // Guild-specific registration dihapus karena bisa gagal diam-diam jika bot
+        // diundang tanpa scope applications.commands di server tertentu.
+        console.log('🔄 Mendaftarkan Slash Commands secara Global (berlaku di semua server & DM)...');
         await rest.put(
             Routes.applicationCommands(client.user.id),
             { body: commands },
         );
-        console.log('✅ Slash Commands Discord berhasil direset dan diregistrasikan!');
+        console.log('✅ Slash Commands Global berhasil didaftarkan! (Mungkin perlu ~1 jam untuk propagasi ke server baru)');
     } catch (error) {
         console.error('❌ Gagal meregistrasikan Slash Commands:', error.message);
     }
@@ -156,14 +116,14 @@ function startDiscordBot() {
               await interaction.deferReply({ flags: MessageFlags.Ephemeral });
               
               try {
-                  const queuePosition = absenQueue.queue.length;
-                  if (absenQueue.isProcessing) {
-                      await interaction.editReply(`⏳ *Sistem sedang digunakan user lain...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`);
+                  const queuePosition = agenticQueue.length;
+                  if (agenticQueue.isProcessing) {
+                      await interaction.editReply(`⏳ *Sistem sedang memproses antrean...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`);
                   }
 
-                  const result = await absenQueue.enqueue(() => loginAndCheckEthol(email, password, async (text) => {
+                  const result = await agenticQueue.enqueue(() => loginAndCheckEthol(email, password, async (text) => {
                       try { await interaction.editReply(`🚀 *Status:* ${text}`); } catch (e) {}
-                  }, 'scan'));
+                  }, 'scan'), userId);
 
                   if (!result.success) {
                       return await interaction.editReply(`❌ *Gagal Scraping:* ${result.error}`);
@@ -218,14 +178,14 @@ function startDiscordBot() {
               await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
               try {
-                  const queuePosition = absenQueue.queue.length;
-                  if (absenQueue.isProcessing) {
-                      await interaction.editReply(`⏳ *Sistem sedang digunakan user lain...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`);
+                  const queuePosition = agenticQueue.length;
+                  if (agenticQueue.isProcessing) {
+                      await interaction.editReply(`⏳ *Sistem sedang memproses antrean...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`);
                   }
 
-                  const result = await absenQueue.enqueue(() => getScheduleMis(email, password, async (text) => {
+                  const result = await agenticQueue.enqueue(() => getScheduleMis(email, password, async (text) => {
                       try { await interaction.editReply(`🚀 *Status:* ${text}`); } catch (e) {}
-                  }));
+                  }), userId);
 
                   if (!result.success) {
                       const errAttachment = result.screenshot ? new AttachmentBuilder(result.screenshot, { name: 'error.jpg' }) : null;
@@ -291,12 +251,12 @@ function startDiscordBot() {
               const { email, password } = creds;
 
               try {
-                  const queuePosition = absenQueue.queue.length;
-                  if (absenQueue.isProcessing) {
-                      await interaction.editReply(`⏳ *Sistem sedang mengeksekusi presensi user lain...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`);
+                  const queuePosition = agenticQueue.length;
+                  if (agenticQueue.isProcessing) {
+                      await interaction.editReply(`⏳ *Sistem sedang mengeksekusi presensi...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`);
                   }
 
-                  const result = await absenQueue.enqueue(() => loginAndCheckEthol(
+                  const result = await agenticQueue.enqueue(() => loginAndCheckEthol(
                     email, 
                     password, 
                     async (text) => {
@@ -308,7 +268,7 @@ function startDiscordBot() {
                         const attachment = new AttachmentBuilder(screenshotBuffer, { name: 'step.jpg' });
                         await interaction.followUp({ content: caption, files: [attachment], flags: MessageFlags.Ephemeral });
                     }
-                  ));
+                  ), userId);
 
                   if (!result.success) {
                     return await interaction.editReply(`❌ *Gagal Scraping:* ${result.error}`);

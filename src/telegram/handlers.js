@@ -17,6 +17,7 @@ const {
   formatStreamItemDetail,
 } = require('../utils');
 const { saveCredentials, getCredentials, deleteCredentials, hasCredentials } = require('../etholCredentials');
+const { agenticQueue } = require('../agenticQueue');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 const fs = require('fs');
@@ -364,11 +365,16 @@ function register(bot) {
 
     (async () => {
       try {
+        const queuePosition = agenticQueue.length;
+        if (agenticQueue.isProcessing) {
+            await safeEdit(ctx, loadingMsg.message_id, `⏳ *Sistem sedang memproses antrean...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`, { parse_mode: 'Markdown' });
+        }
+        
         const { loginAndCheckEthol } = require('../etholService');
         
-        const result = await loginAndCheckEthol(email, password, async (text) => {
+        const result = await agenticQueue.enqueue(() => loginAndCheckEthol(email, password, async (text) => {
           await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
-        }, 'scan');
+        }, 'scan'), userId);
 
         if (!result.success) {
           return await safeEdit(ctx, loadingMsg.message_id, `❌ *Gagal Scraping:* ${result.error}`, { parse_mode: 'Markdown' });
@@ -420,9 +426,13 @@ function register(bot) {
 
     (async () => {
       try {
+        const queuePosition = agenticQueue.length;
+        if (agenticQueue.isProcessing) {
+            await safeEdit(ctx, loadingMsg.message_id, `⏳ *Sistem sedang mengeksekusi presensi...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`, { parse_mode: 'Markdown' });
+        }
         const { loginAndCheckEthol } = require('../etholService');
         
-        const result = await loginAndCheckEthol(
+        const result = await agenticQueue.enqueue(() => loginAndCheckEthol(
           email, 
           password, 
           async (text) => {
@@ -434,7 +444,7 @@ function register(bot) {
             // Kirim foto langsung ke chat tanpa menghapus pesan loading
             await ctx.replyWithPhoto({ source: screenshotBuffer }, { caption, parse_mode: 'Markdown' }).catch(() => {});
           }
-        );
+        ), userId);
 
         if (!result.success) {
           return await safeEdit(ctx, loadingMsg.message_id, `❌ *Gagal Scraping:* ${result.error}`, { parse_mode: 'Markdown' });
@@ -518,11 +528,15 @@ function register(bot) {
 
     (async () => {
       try {
+        const queuePosition = agenticQueue.length;
+        if (agenticQueue.isProcessing) {
+            await safeEdit(ctx, loadingMsg.message_id, `⏳ *Sistem sedang memproses antrean...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`, { parse_mode: 'Markdown' });
+        }
         const { getScheduleMis } = require('../misService');
         
-        const result = await getScheduleMis(email, password, async (text) => {
+        const result = await agenticQueue.enqueue(() => getScheduleMis(email, password, async (text) => {
            await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
-        });
+        }), userId);
 
         await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
 
@@ -732,12 +746,17 @@ function register(bot) {
     if (!url.startsWith('http')) return ctx.reply('URL harus diawali dengan http:// atau https://');
     
     const instruction = parts.slice(2).join(' ');
+    const userId = String(ctx.from.id);
     
     const loadingMsg = await ctx.reply('🚀 Menjalankan Orion Web Agent...\n\nTarget: ' + url + '\nMisi: ' + instruction);
     
     try {
+      const queuePosition = agenticQueue.length;
+      if (agenticQueue.isProcessing) {
+          await safeEdit(ctx, loadingMsg.message_id, `⏳ *Sistem sedang memproses antrean...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`, { parse_mode: 'Markdown' });
+      }
       const { executeAgenticTask } = require('../agenticBrowser');
-      await executeAgenticTask(
+      await agenticQueue.enqueue(() => executeAgenticTask(
         url,
         instruction,
         async (progressText) => {
@@ -748,7 +767,7 @@ function register(bot) {
             await ctx.replyWithPhoto({ source: screenshotBuffer }, { caption, parse_mode: 'Markdown' }).catch(() => {});
           }
         }
-      );
+      ), userId);
     } catch (err) {
       await safeEdit(ctx, loadingMsg.message_id, `❌ *Agent Error:*\n${err.message}`, { parse_mode: 'Markdown' });
     }
