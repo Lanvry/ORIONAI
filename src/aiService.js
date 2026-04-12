@@ -315,30 +315,32 @@ async function askAI(chatId, userMessage, assignmentsObj = [], courses = [], onS
       const keyLabel = keyIdx === 0 ? 'Primary' : 'Backup-' + keyIdx;
       console.log(`[AI] Trying REST Gemini ${keyLabel} (key ${keyIdx + 1}/${GEMINI_KEYS.length})...`);
       const answer = await askGeminiWithREST(keyIdx, chatId, userMessage, systemInstructionText, pastHistory, onStream);
-      if (answer) return answer;
+      if (answer && answer.trim().length > 0) return answer;
+      // Jika jawaban kosong, lanjut ke key berikutnya
+      console.warn(`[AI] Gemini key ${keyIdx + 1} mengembalikan respons kosong, mencoba key berikutnya...`);
     } catch (err) {
       const errMsg = err.message ? err.message.toLowerCase() : '';
       const isAxiosError = err.response && err.response.data && err.response.data.error;
       const trueErrMsg = isAxiosError ? err.response.data.error.message : errMsg;
-      
-      const shouldFallback = trueErrMsg.includes('quota') || trueErrMsg.includes('429') || trueErrMsg.includes('exhausted') || trueErrMsg.includes('503') || trueErrMsg.includes('unavailable');
-      if (shouldFallback) {
-        console.warn(`[AI] Gemini key ${keyIdx + 1} sibuk (${trueErrMsg.substring(0, 30)}), mencoba berikutnya...`);
-        continue;
-      }
-      
-      console.warn(`[AI] Gemini (key ${keyIdx + 1}) REST Error: ${trueErrMsg}`);
-      break; 
+      // Selalu lanjut ke Gemini key berikutnya untuk SEMUA jenis error
+      console.warn(`[AI] Gemini key ${keyIdx + 1} error (${trueErrMsg.substring(0, 50)}), mencoba key berikutnya...`);
     }
   }
 
-  console.warn('[AI] Semua Gemini key gagal/habis. Trying Siputzx GPT OSS...');
+  console.warn('[AI] Semua Gemini key gagal/habis. Mencoba Siputzx...');
   try {
-    return await askSiputzxGLM(chatId, userMessage, systemInstructionText, pastHistory, onStream);
+    const siputzxAnswer = await askSiputzxGLM(chatId, userMessage, systemInstructionText, pastHistory, onStream);
+    // Cek apakah Siputzx memberikan respons yang valid (tidak kosong)
+    if (siputzxAnswer && siputzxAnswer.trim().length > 0) {
+      return siputzxAnswer;
+    }
+    console.warn('[AI] Siputzx tidak memberikan respons (kosong), falling back ke OpenRouter...');
   } catch (errGlm) {
-    console.warn('[AI] Siputzx gagal:', errGlm.message, 'falling back to OpenRouter (Qwen)...');
-    return await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory, onStream);
+    console.warn('[AI] Siputzx error:', errGlm.message, '→ falling back ke OpenRouter...');
   }
+
+  console.warn('[AI] Mencoba OpenRouter sebagai fallback terakhir...');
+  return await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory, onStream);
 }
 
 async function ringkasAssignmentWithREST(keyIndex, prompt) {
