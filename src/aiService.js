@@ -54,6 +54,73 @@ async function askSiputzxGLM(chatId, userParts, systemInstruction, pastHistory, 
   }
 }
 
+// Daftar model OpenRouter (urutan prioritas, fallback otomatis jika 404/error)
+const OPENROUTER_MODELS = [
+  process.env.OPENROUTER_MODEL,
+  'meta-llama/llama-3.1-8b-instruct:free',
+  'google/gemma-3-12b-it:free',
+  'mistralai/mistral-7b-instruct:free',
+].filter(Boolean);
+
+async function callOpenRouterWithModel(model, messages, apiKey, onStream) {
+  const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+    model: model,
+    messages: messages,
+    temperature: 0.7,
+    stream: true,
+  }, {
+    responseType: 'stream',
+    timeout: 60000,
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://github.com/Lanvry/ORIONAI',
+      'X-Title': 'Orion AI'
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    let fullText = '';
+    let lastEditTime = 0;
+    let partialChunk = '';
+
+    response.data.on('data', (chunk) => {
+      partialChunk += chunk.toString('utf8');
+      const lines = partialChunk.split('\n');
+      partialChunk = lines.pop() || '';
+
+      for (let line of lines) {
+        line = line.trim();
+        if (line === 'data: [DONE]') continue;
+        if (line.startsWith('data: ')) {
+          try {
+            const parsed = JSON.parse(line.slice(6));
+            // Tangani error di dalam stream (misal: model tidak ada)
+            if (parsed.error) {
+              reject(new Error(`OpenRouter stream error: ${parsed.error.message || JSON.stringify(parsed.error)}`));
+              return;
+            }
+            if (parsed.choices && parsed.choices[0].delta && parsed.choices[0].delta.content) {
+              fullText += parsed.choices[0].delta.content;
+            }
+          } catch (e) {
+            // Ignore SSE decode error
+          }
+        }
+      }
+
+      const now = Date.now();
+      if (now - lastEditTime > 1500) {
+        lastEditTime = now;
+        if (onStream && fullText) onStream(fullText);
+      }
+    });
+
+    response.data.on('end', () => resolve(fullText));
+    response.data.on('error', reject);
+  });
+}
+
 async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory, onStream) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error('API Key OpenRouter tidak ada (.env).');
@@ -67,9 +134,7 @@ async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory, 
     messages.push({ role, content: textParts });
   }
 
-  let hasImage = false;
   let currentUserContent;
-  
   if (typeof userParts === 'string') {
     currentUserContent = userParts;
   } else if (Array.isArray(userParts)) {
@@ -80,7 +145,6 @@ async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory, 
       } else if (part.text) {
         currentUserContent.push({ type: 'text', text: part.text });
       } else if (part.inlineData) {
-        hasImage = true;
         currentUserContent.push({
           type: 'image_url',
           image_url: { url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}` }
@@ -90,75 +154,43 @@ async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory, 
   }
 
   messages.push({ role: 'user', content: currentUserContent });
-  const modelQuery = 'qwen/qwen3.6-plus:free';
 
-  try {
-    const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
-      model: process.env.OPENROUTER_MODEL || modelQuery,
-      messages: messages,
-      temperature: 0.7,
-      stream: true,
-    }, {
-      responseType: 'stream',
-      timeout: 60000,
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://github.com/Lanvry/ORIONAI',
-        'X-Title': 'Orion AI'
+  let lastError = null;
+  for (let i = 0; i < OPENROUTER_MODELS.length; i++) {
+    const model = OPENROUTER_MODELS[i];
+    try {
+      console.log(`[AI] Mencoba OpenRouter model: ${model}...`);
+      const result = await callOpenRouterWithModel(model, messages, apiKey, onStream);
+      if (result && result.trim().length > 0) return result;
+      console.warn(`[AI] OpenRouter model ${model} menghasilkan respons kosong, mencoba model berikutnya...`);
+    } catch (err) {
+      const statusCode = err.response && err.response.status;
+      const is429 = statusCode === 429;
+      const is404 = statusCode === 404 || (err.message && err.message.includes('404'));
+
+      if (is404) {
+        console.warn(`[AI] OpenRouter model "${model}" tidak ditemukan (404), mencoba model berikutnya...`);
+        lastError = err;
+        continue;
       }
-    });
 
-    return new Promise((resolve, reject) => {
-      let fullText = '';
-      let lastEditTime = 0;
-      let partialChunk = '';
-
-      response.data.on('data', (chunk) => {
-        partialChunk += chunk.toString('utf8');
-        const lines = partialChunk.split('\n');
-        partialChunk = lines.pop() || ''; 
-
-        for (let line of lines) {
-          line = line.trim();
-          if (line === 'data: [DONE]') continue;
-          if (line.startsWith('data: ')) {
-            try {
-              const parsed = JSON.parse(line.slice(6));
-              if (parsed.choices && parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                fullText += parsed.choices[0].delta.content;
-              }
-            } catch (e) {
-              // Ignore SSE decode error
-            }
-          }
+      if (is429) {
+        if (i === 0 && OPENROUTER_MODELS.length > 1) {
+          console.warn(`[AI] OpenRouter rate limit (429), mencoba model berikutnya...`);
+          lastError = err;
+          continue;
         }
+        throw new Error('Terlalu banyak permintaan ke OpenRouter (Rate limit tercapai).');
+      }
 
-        const now = Date.now();
-        if (now - lastEditTime > 1500) {
-          lastEditTime = now;
-          if (onStream && fullText) onStream(fullText);
-        }
-      });
-
-      response.data.on('end', () => resolve(fullText));
-      response.data.on('error', reject);
-    });
-  } catch (err) {
-    const is429 = err.response && err.response.status === 429;
-    const retryCount = typeof this.retryCount === 'number' ? this.retryCount : 0;
-    
-    if (is429 && retryCount < 2) {
-      if (onStream) onStream('\u23F3 Server Qwen (OpenRouter) sedang penuh antrian (429). Mencoba ulang...');
-      await new Promise(r => setTimeout(r, 3000));
-      const boundFn = askOpenRouter.bind({ retryCount: retryCount + 1 });
-      return await boundFn(chatId, userParts, systemInstruction, pastHistory, onStream);
+      lastError = err;
+      console.warn(`[AI] OpenRouter model "${model}" error: ${err.message}`);
+      // Jika bukan 404/429, langsung lempar error (misal: auth error)
+      if (!is404 && !is429) break;
     }
-    
-    let errMsg = err.message;
-    if (is429) errMsg = 'Terlalu banyak permintaan (Rate limit OpenRouter tercapai).';
-    throw new Error(`OpenRouter gagal: ${errMsg}`);
   }
+
+  throw new Error(`OpenRouter gagal (semua model dicoba): ${lastError ? lastError.message : 'Unknown error'}`);
 }
 
 async function askGeminiWithREST(keyIndex, chatId, userMessage, systemInstructionText, pastHistory, onStream) {
