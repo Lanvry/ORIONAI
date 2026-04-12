@@ -1,4 +1,8 @@
 const axios = require('axios');
+const https = require('https');
+
+// Agent khusus Gemini: SSL verify false (menghindari SSL error di beberapa environment)
+const geminiHttpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 // ─── AI Instance (Multi-Key Rotation) ─────────────────────────────────────────
 const GEMINI_KEYS = [];
@@ -11,6 +15,19 @@ function initGeminiKeys() {
 
 // ─── AI Chat & Fallback ─────────────────────────────────────────────
 const chatHistories = {};
+const MAX_HISTORY_MESSAGES = 20; // 10 exchange (user + model)
+
+// Helper: simpan histori percakapan dengan batas maksimum
+function saveHistory(chatId, userMessage, aiResponse) {
+  if (!chatHistories[chatId]) chatHistories[chatId] = { history: [] };
+  const history = chatHistories[chatId].history;
+  history.push({ role: 'user', parts: [{ text: userMessage }] });
+  history.push({ role: 'model', parts: [{ text: aiResponse }] });
+  // Potong histori jika melebihi batas (hapus pesan paling lama)
+  if (history.length > MAX_HISTORY_MESSAGES) {
+    history.splice(0, history.length - MAX_HISTORY_MESSAGES);
+  }
+}
 
 async function askSiputzxGLM(chatId, userParts, systemInstruction, pastHistory, onStream) {
   let hasImage = false;
@@ -193,50 +210,65 @@ async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory, 
   throw new Error(`OpenRouter gagal (semua model dicoba): ${lastError ? lastError.message : 'Unknown error'}`);
 }
 
-async function askGeminiWithREST(keyIndex, chatId, userMessage, systemInstructionText, pastHistory, onStream) {
-  const apiKey = GEMINI_KEYS[keyIndex];
-  if (!apiKey) return null;
+// Model Gemini yang digunakan
+const GEMINI_MODELS = [
+  'gemini-flash-latest',
+];
 
+async function askGeminiWithModel(apiKey, model, chatId, userMessage, systemInstructionText, pastHistory, onStream) {
   const contents = [];
-  
+
   if (pastHistory && pastHistory.length > 0) {
     pastHistory.forEach(h => {
-      contents.push({
-        role: h.role, // 'user' or 'model'
-        parts: h.parts
-      });
+      contents.push({ role: h.role, parts: h.parts });
     });
   }
+  contents.push({ role: 'user', parts: [{ text: userMessage }] });
 
-  contents.push({
-    role: 'user',
-    parts: [{ text: userMessage }]
-  });
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${apiKey}`;
-
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
   const payload = {
-    contents: contents,
-    system_instruction: {
-      parts: { text: systemInstructionText }
-    },
-    generationConfig: {
-      maxOutputTokens: 2048,
-      temperature: 0.7
-    }
+    contents,
+    system_instruction: { parts: { text: systemInstructionText } },
+    generationConfig: { maxOutputTokens: 2048, temperature: 0.7 }
   };
 
-  const response = await axios.post(url, payload, { timeout: 12000, responseType: 'stream' });
+  // Connection timeout: 25 detik untuk handshake awal
+  // Setelah koneksi terbuka, data langsung distream tanpa dibatasi
+  const response = await axios.post(url, payload, {
+    timeout: 25000,
+    responseType: 'stream',
+    httpsAgent: geminiHttpsAgent  // SSL verify false
+  });
 
   return new Promise((resolve, reject) => {
     let fullText = '';
     let lastEditTime = 0;
     let partialChunk = '';
 
+    // Idle timeout: jika stream terbuka tapi TIDAK ada data masuk selama 3 menit
+    // → berarti Gemini stuck, pindah ke key berikutnya
+    const IDLE_TIMEOUT_MS = 3 * 60 * 1000; // 3 menit
+    let idleTimer = null;
+
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        response.data.destroy();
+        reject(new Error(`Gemini idle timeout: tidak ada data masuk selama 3 menit`));
+      }, IDLE_TIMEOUT_MS);
+    };
+
+    // Mulai idle timer sejak stream terbuka
+    resetIdleTimer();
+
     response.data.on('data', (chunk) => {
+      // Reset idle timer setiap ada data masuk
+      resetIdleTimer();
+
       partialChunk += chunk.toString('utf8');
       const lines = partialChunk.split('\n');
-      partialChunk = lines.pop() || ''; 
+      partialChunk = lines.pop() || '';
+
       for (let line of lines) {
         line = line.trim();
         if (line === '') continue;
@@ -251,21 +283,28 @@ async function askGeminiWithREST(keyIndex, chatId, userMessage, systemInstructio
           } catch (e) {}
         }
       }
+
+      // Kirim update lebih cepat: setiap 800ms (bukan 1500ms)
+      // agar user langsung lihat respon tanpa delay
       const now = Date.now();
-      if (now - lastEditTime > 1500) {
+      if (now - lastEditTime > 800) {
         lastEditTime = now;
         if (onStream && fullText) onStream(fullText);
       }
     });
 
     response.data.on('end', () => {
-      if (!chatHistories[chatId]) chatHistories[chatId] = { history: [] };
-      chatHistories[chatId].history.push({ role: 'user', parts: [{ text: userMessage }] });
-      chatHistories[chatId].history.push({ role: 'model', parts: [{ text: fullText }] });
+      if (idleTimer) clearTimeout(idleTimer);
+      // Kirim teks final (pastikan semua terkirim)
+      if (onStream && fullText) onStream(fullText);
+      saveHistory(chatId, userMessage, fullText);
       resolve(fullText);
     });
 
-    response.data.on('error', reject);
+    response.data.on('error', (err) => {
+      if (idleTimer) clearTimeout(idleTimer);
+      reject(err);
+    });
   });
 }
 
@@ -310,28 +349,40 @@ async function askAI(chatId, userMessage, assignmentsObj = [], courses = [], onS
         tugasContext;
   }
 
+  // Iterasi semua kombinasi key × model Gemini
   for (let keyIdx = 0; keyIdx < GEMINI_KEYS.length; keyIdx++) {
-    try {
-      const keyLabel = keyIdx === 0 ? 'Primary' : 'Backup-' + keyIdx;
-      console.log(`[AI] Trying REST Gemini ${keyLabel} (key ${keyIdx + 1}/${GEMINI_KEYS.length})...`);
-      const answer = await askGeminiWithREST(keyIdx, chatId, userMessage, systemInstructionText, pastHistory, onStream);
-      if (answer && answer.trim().length > 0) return answer;
-      // Jika jawaban kosong, lanjut ke key berikutnya
-      console.warn(`[AI] Gemini key ${keyIdx + 1} mengembalikan respons kosong, mencoba key berikutnya...`);
-    } catch (err) {
-      const errMsg = err.message ? err.message.toLowerCase() : '';
-      const isAxiosError = err.response && err.response.data && err.response.data.error;
-      const trueErrMsg = isAxiosError ? err.response.data.error.message : errMsg;
-      // Selalu lanjut ke Gemini key berikutnya untuk SEMUA jenis error
-      console.warn(`[AI] Gemini key ${keyIdx + 1} error (${trueErrMsg.substring(0, 50)}), mencoba key berikutnya...`);
+    const keyLabel = keyIdx === 0 ? 'Primary' : `Backup-${keyIdx}`;
+    for (let modelIdx = 0; modelIdx < GEMINI_MODELS.length; modelIdx++) {
+      const model = GEMINI_MODELS[modelIdx];
+      try {
+        console.log(`[AI] Gemini ${keyLabel} key-${keyIdx + 1} + model ${model}...`);
+        const answer = await askGeminiWithModel(GEMINI_KEYS[keyIdx], model, chatId, userMessage, systemInstructionText, pastHistory, onStream);
+        if (answer && answer.trim().length > 0) return answer;
+        console.warn(`[AI] Gemini ${keyLabel}/${model} → respons kosong, lanjut...`);
+      } catch (err) {
+        const statusCode = err.response && err.response.status;
+        const isTimeout = err.code === 'ECONNABORTED' || (err.message && err.message.includes('timeout'));
+        const is429 = statusCode === 429;
+        const errBody = err.response && err.response.data && err.response.data.error;
+        const errMsg = errBody ? errBody.message : err.message;
+        if (is429) {
+          console.warn(`[AI] Gemini ${keyLabel}/${model} → Rate limit (429), skip ke key berikutnya...`);
+        } else if (isTimeout) {
+          console.warn(`[AI] Gemini ${keyLabel}/${model} → Timeout (Gemini tidak merespons dalam 20s), skip...`);
+        } else {
+          console.warn(`[AI] Gemini ${keyLabel}/${model} → error ${statusCode || ''}: ${String(errMsg).substring(0, 60)}, lanjut...`);
+        }
+        // Selalu lanjut ke key/model berikutnya
+      }
     }
   }
 
   console.warn('[AI] Semua Gemini key gagal/habis. Mencoba Siputzx...');
   try {
     const siputzxAnswer = await askSiputzxGLM(chatId, userMessage, systemInstructionText, pastHistory, onStream);
-    // Cek apakah Siputzx memberikan respons yang valid (tidak kosong)
     if (siputzxAnswer && siputzxAnswer.trim().length > 0) {
+      // Simpan ke histori agar percakapan berikutnya ingat konteks ini
+      saveHistory(chatId, userMessage, siputzxAnswer);
       return siputzxAnswer;
     }
     console.warn('[AI] Siputzx tidak memberikan respons (kosong), falling back ke OpenRouter...');
@@ -340,17 +391,22 @@ async function askAI(chatId, userMessage, assignmentsObj = [], courses = [], onS
   }
 
   console.warn('[AI] Mencoba OpenRouter sebagai fallback terakhir...');
-  return await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory, onStream);
+  const openRouterAnswer = await askOpenRouter(chatId, userMessage, systemInstructionText, pastHistory, onStream);
+  if (openRouterAnswer && openRouterAnswer.trim().length > 0) {
+    // Simpan ke histori agar percakapan berikutnya ingat konteks ini
+    saveHistory(chatId, userMessage, openRouterAnswer);
+  }
+  return openRouterAnswer;
 }
 
 async function ringkasAssignmentWithREST(keyIndex, prompt) {
   const apiKey = GEMINI_KEYS[keyIndex];
   if (!apiKey) return null;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
   const payload = {
     contents: [{ role: 'user', parts: [{ text: prompt }] }]
   };
-  const response = await axios.post(url, payload, { timeout: 12000 });
+  const response = await axios.post(url, payload, { timeout: 60000 });
   if (response.data && response.data.candidates && response.data.candidates[0].content) {
     return response.data.candidates[0].content.parts[0].text;
   }
@@ -370,18 +426,13 @@ async function ringkasAssignment(assignment, onStream) {
   for (let keyIdx = 0; keyIdx < GEMINI_KEYS.length; keyIdx++) {
     try {
       const result = await ringkasAssignmentWithREST(keyIdx, prompt);
-      if (result) return result;
+      if (result && result.trim().length > 0) return result;
     } catch (err) {
-      const errMsg = err.message ? err.message.toLowerCase() : '';
-      const isAxiosError = err.response && err.response.data && err.response.data.error;
-      const trueErrMsg = isAxiosError ? err.response.data.error.message : errMsg;
-      
-      const shouldFallback = trueErrMsg.includes('quota') || trueErrMsg.includes('429') || trueErrMsg.includes('exhausted') || trueErrMsg.includes('503') || trueErrMsg.includes('unavailable');
-      if (shouldFallback) {
-        console.warn(`[AI] Gemini key ${keyIdx + 1} sibuk (ringkas), lanjut...`);
-        continue;
-      }
-      break;
+      const statusCode = err.response && err.response.status;
+      const errBody = err.response && err.response.data && err.response.data.error;
+      const errMsg = errBody ? errBody.message : err.message;
+      console.warn(`[AI] Gemini ringkas key-${keyIdx + 1} error ${statusCode || ''}: ${String(errMsg).substring(0, 60)}, lanjut...`);
+      // Selalu lanjut ke key berikutnya
     }
   }
 
