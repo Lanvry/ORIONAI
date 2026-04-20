@@ -4,6 +4,10 @@ const { getCredentials, saveCredentials } = require('../etholCredentials');
 const { loginAndCheckEthol } = require('../etholService');
 const { getScheduleMis } = require('../misService');
 const { agenticQueue } = require('../agenticQueue');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const DISCORD_BOT_PERSONA = 'Kamu adalah bot representasi PENS Sumenep yang cerdas, ramah, dan asik. Kamu dihidupkan dengan sistem inti Orion AI. ' +
     'Instruksi Gaya Bahasa:\n' +
@@ -310,6 +314,31 @@ function startDiscordBot() {
       }
   });
 
+  // ─── Helper: Download Attachment Discord ke temp file ─────────────────────
+  async function downloadDiscordAttachment(url, fileName) {
+    const tempPath = path.join(os.tmpdir(), `discord_${Date.now()}_${fileName}`);
+    const response = await axios({ method: 'GET', url, responseType: 'stream' });
+    return new Promise((resolve, reject) => {
+      const writer = fs.createWriteStream(tempPath);
+      response.data.pipe(writer);
+      writer.on('finish', () => resolve(tempPath));
+      writer.on('error', reject);
+    });
+  }
+
+  // ─── Helper: Ambil MIME type dari ekstensi file ────────────────────────────
+  function getDiscordMimeType(fileName) {
+    const ext = (fileName.split('.').pop() || '').toLowerCase();
+    const map = {
+      jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+      gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
+      pdf: 'application/pdf', txt: 'text/plain',
+      js: 'application/javascript', json: 'application/json',
+      mp4: 'video/mp4', mp3: 'audio/mpeg',
+    };
+    return map[ext] || 'application/octet-stream';
+  }
+
   client.on('messageCreate', async (message) => {
     // Abaikan pesan dari bot lain
     if (message.author.bot) return;
@@ -322,7 +351,10 @@ function startDiscordBot() {
     const isMentioned = message.mentions.has(client.user.id);
     const prefix = '!orion ';
     const hasPrefix = message.content.toLowerCase().startsWith(prefix);
-    
+
+    // Cek apakah ada attachment (gambar/file)
+    const hasAttachment = message.attachments.size > 0;
+
     if (!isMentioned && !isDirectMessage && !hasPrefix) return;
 
     const userId = message.author.id.toString();
@@ -335,8 +367,72 @@ function startDiscordBot() {
     }
     userMessage = userMessage.trim();
 
+    // ─── Jika ada attachment: proses gambar/file ke AI ────────────────────────
+    if (hasAttachment) {
+        const attachment = message.attachments.first();
+        const fileName = attachment.name || `file_${Date.now()}`;
+        const mimeType = attachment.contentType || getDiscordMimeType(fileName);
+        const caption = userMessage || null;
+
+        const botMessage = await message.reply('👀 Memeriksa gambar/file...');
+        let tempPath = null;
+
+        try {
+            // Download attachment ke temp file
+            tempPath = await downloadDiscordAttachment(attachment.url, fileName);
+
+            const parts = [];
+
+            // Jika file teks: baca sebagai string
+            if (
+                mimeType.startsWith('text/') ||
+                mimeType === 'application/javascript' ||
+                mimeType === 'application/json' ||
+                mimeType.includes('xml')
+            ) {
+                const textContent = fs.readFileSync(tempPath, 'utf8');
+                parts.push(
+                    'Isi file (' + fileName + '):\n```\n' +
+                    textContent.slice(0, 10000) +
+                    '\n```\n\n' + (caption || 'Tolong jelaskan file ini.')
+                );
+            } else {
+                // Untuk gambar dan file lainnya: kirim sebagai base64 inline data
+                const base64data = fs.readFileSync(tempPath).toString('base64');
+                parts.push({ inlineData: { data: base64data, mimeType } });
+                parts.push(caption || 'Tolong analisa gambar/file ini. Jelaskan apa yang kamu lihat secara detail.');
+            }
+
+            // Hapus temp file setelah selesai dibaca
+            try { fs.unlinkSync(tempPath); } catch (e) {}
+            tempPath = null;
+
+            const answer = await askAI(userId, parts, [], [], async (streamText) => {
+                try {
+                    if (streamText.length > 0) {
+                        const safeText = streamText.length > 2000 ? streamText.substring(0, 1996) + '...' : streamText;
+                        await botMessage.edit(safeText);
+                    }
+                } catch (e) { /* ignore rate limits */ }
+            }, DISCORD_BOT_PERSONA);
+
+            if (answer) {
+                const safeText = answer.length > 2000 ? answer.substring(0, 1996) + '...' : answer;
+                await botMessage.edit(safeText);
+            } else {
+                await botMessage.edit('Maaf, aku tidak bisa menganalisa file ini saat ini.');
+            }
+        } catch (err) {
+            // Cleanup jika masih ada
+            if (tempPath) { try { fs.unlinkSync(tempPath); } catch (e) {} }
+            await botMessage.edit(`❌ Error saat memproses file: ${err.message}`);
+        }
+        return;
+    }
+
+    // ─── Tidak ada attachment: proses sebagai pesan teks biasa ───────────────
     if (!userMessage) {
-        await message.reply("Halo! Aku Orion AI. Ketik `!orion pertanyaanmu` untuk mengobrol atau langsung ketik pesanmu jika di DM! 👋");
+        await message.reply("Halo! Aku Orion AI. Ketik `/orion pertanyaanmu` untuk mengobrol atau langsung ketik pesanmu jika di DM! 👋\n\nKamu juga bisa kirim gambar langsung dan aku akan menganalisisnya! 🖼️");
         return;
     }
 

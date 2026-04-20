@@ -218,12 +218,31 @@ const GEMINI_MODELS = [
 async function askGeminiWithModel(apiKey, model, chatId, userMessage, systemInstructionText, pastHistory, onStream) {
   const contents = [];
 
-  if (pastHistory && pastHistory.length > 0) {
+  // Deteksi apakah request ini mengandung gambar/file (multimodal)
+  const isMultimodal = Array.isArray(userMessage) && userMessage.some(
+    p => p && typeof p === 'object' && p.inlineData
+  );
+
+  // Jika ada gambar, TIDAK sertakan chat history (Gemini tidak mendukung
+  // history bersamaan dengan multipart/inlineData di model flash)
+  if (!isMultimodal && pastHistory && pastHistory.length > 0) {
     pastHistory.forEach(h => {
       contents.push({ role: h.role, parts: h.parts });
     });
   }
-  contents.push({ role: 'user', parts: [{ text: userMessage }] });
+
+  // Bungkus parts sesuai format:
+  // - Array parts (gambar + teks) → langsung pakai
+  // - String biasa             → bungkus sebagai { text: ... }
+  if (Array.isArray(userMessage)) {
+    // Normalisasi: string murni dalam array juga jadi { text }
+    const normalizedParts = userMessage.map(p =>
+      typeof p === 'string' ? { text: p } : p
+    );
+    contents.push({ role: 'user', parts: normalizedParts });
+  } else {
+    contents.push({ role: 'user', parts: [{ text: userMessage }] });
+  }
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
   const payload = {
@@ -297,7 +316,10 @@ async function askGeminiWithModel(apiKey, model, chatId, userMessage, systemInst
       if (idleTimer) clearTimeout(idleTimer);
       // Kirim teks final (pastikan semua terkirim)
       if (onStream && fullText) onStream(fullText);
-      saveHistory(chatId, userMessage, fullText);
+      // Simpan histori: jika multimodal (gambar), simpan placeholder teks
+      // agar tidak membengkakkan memori dengan data base64
+      const historyUserMsg = isMultimodal ? '[pengguna mengirim gambar/file]' : userMessage;
+      saveHistory(chatId, historyUserMsg, fullText);
       resolve(fullText);
     });
 
