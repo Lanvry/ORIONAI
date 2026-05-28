@@ -88,8 +88,14 @@ async function getAuthenticatedClient(userId) {
       fs.writeFileSync(tokenPath, JSON.stringify(token, null, 2));
       console.log(`🔄 Token Google berhasil diperbarui untuk user ${userId}.`);
     } catch (err) {
-      console.error(`⚠️ Gagal refresh token untuk ${userId}:`, err.message);
-      // Tetap coba pakai token lama
+      console.error(`⚠️ Gagal refresh token untuk ${userId}: ${err.message}`);
+      // invalid_grant berarti token sudah dicabut — hapus dan minta login ulang
+      if (err.message && err.message.includes('invalid_grant')) {
+        try { fs.unlinkSync(tokenPath); } catch (_) {}
+        console.log(`🗑️ Token invalid untuk ${userId} telah dihapus. User perlu login ulang.`);
+        return null;
+      }
+      // Error lain: tetap coba pakai token lama
     }
   }
 

@@ -18,6 +18,69 @@ const {
 } = require('../utils');
 const { saveCredentials, getCredentials, deleteCredentials, hasCredentials } = require('../etholCredentials');
 const { agenticQueue } = require('../agenticQueue');
+
+function splitText(text, limit) {
+    if (text.length <= limit) return [text];
+    
+    const lines = text.split('\n');
+    const chunks = [];
+    let currentChunk = '';
+    let inCodeBlock = false;
+    let currentLang = '';
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        let addedLength = line.length + 1;
+        let closingCost = inCodeBlock ? 4 : 0;
+        
+        if (currentChunk.length + addedLength + closingCost > limit && currentChunk.length > 0) {
+            if (inCodeBlock) currentChunk += '```\n';
+            chunks.push(currentChunk.trimEnd());
+            
+            const isClosingCodeBlock = inCodeBlock && line.trim().startsWith('```');
+            if (inCodeBlock && !isClosingCodeBlock) {
+                currentChunk = '```' + currentLang + '\n' + line + '\n';
+            } else if (isClosingCodeBlock) {
+                currentChunk = '';
+            } else {
+                currentChunk = line + '\n';
+            }
+        } else {
+            currentChunk += line + '\n';
+        }
+        
+        if (line.trim().startsWith('```')) {
+            if (!inCodeBlock) {
+                inCodeBlock = true;
+                currentLang = line.trim().substring(3).trim();
+            } else {
+                inCodeBlock = false;
+                currentLang = '';
+            }
+        }
+    }
+    
+    if (currentChunk.trim().length > 0) {
+        chunks.push(currentChunk.trimEnd());
+    }
+    
+    const finalChunks = [];
+    for (const chunk of chunks) {
+        let temp = chunk;
+        while (temp.length > limit) {
+            let splitAt = temp.lastIndexOf('\n', limit);
+            if (splitAt === -1 || splitAt < limit * 0.5) splitAt = temp.lastIndexOf(' ', limit);
+            if (splitAt === -1 || splitAt < limit * 0.5) splitAt = limit;
+            
+            finalChunks.push(temp.slice(0, splitAt));
+            temp = temp.slice(splitAt).trimStart();
+        }
+        if (temp.length > 0) finalChunks.push(temp);
+    }
+    
+    return finalChunks;
+}
+
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 const fs = require('fs');
@@ -421,29 +484,23 @@ function register(bot) {
     }
     const { email, password } = creds;
 
-    const loadingMsg = await ctx.reply(`🚀 Mengeksekusi presensi untuk *${targetCourse}*...\n\n_Bot akan mengirim foto di setiap langkah._`, { parse_mode: 'Markdown' });
-
+    const loadingMsg = await ctx.reply(`⏳ Bentar bang tak absenin...`, { parse_mode: 'Markdown' });
 
     (async () => {
       try {
         const queuePosition = agenticQueue.length;
         if (agenticQueue.isProcessing) {
-            await safeEdit(ctx, loadingMsg.message_id, `⏳ *Sistem sedang mengeksekusi presensi...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`, { parse_mode: 'Markdown' });
+            await safeEdit(ctx, loadingMsg.message_id, `⏳ *Antrean Absen...*\nKamu berada di urutan ke-${queuePosition + 1}. Mohon tunggu sejenak.`, { parse_mode: 'Markdown' });
         }
         const { loginAndCheckEthol } = require('../etholService');
         
         const result = await agenticQueue.enqueue(() => loginAndCheckEthol(
           email, 
           password, 
-          async (text) => {
-            await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
-          }, 
+          null, 
           'execute', 
           targetCourse,
-          async (screenshotBuffer, caption) => {
-            // Kirim foto langsung ke chat tanpa menghapus pesan loading
-            await ctx.replyWithPhoto({ source: screenshotBuffer }, { caption, parse_mode: 'Markdown' }).catch(() => {});
-          }
+          null
         ), userId);
 
         if (!result.success) {
@@ -563,6 +620,117 @@ function register(bot) {
       }
     })();
   });
+
+  // ─── Flow Cek Presensi MIS PENS ─────────────────────────────────────────
+  bot.hears(['/checkpresensi'], async function(ctx) {
+    const userId = String(ctx.from.id);
+    const creds = getCredentials(userId);
+
+    if (!creds) {
+      return ctx.reply(
+        '⚠️ Kredensial belum disimpan.\n\nGunakan perintah /ethollogin untuk menyimpan email dan password secara aman (kredensial ini juga digunakan untuk MIS PENS).',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    const { email, password } = creds;
+    const loadingMsg = await ctx.reply('🚀 Membuka portal Akademik MIS PENS...', { parse_mode: 'Markdown' });
+
+    (async () => {
+      try {
+        const queuePosition = agenticQueue.length;
+        if (agenticQueue.isProcessing) {
+            await safeEdit(ctx, loadingMsg.message_id, `⏳ *Sistem sedang memproses antrean...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`, { parse_mode: 'Markdown' });
+        }
+        const { getPresensiMis } = require('../misService');
+        
+        const result = await agenticQueue.enqueue(() => getPresensiMis(email, password, async (text) => {
+           await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
+        }), userId);
+
+        await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+
+        if (!result.success) {
+           let errMsg = `❌ *Gagal Scraping Presensi:* ${result.error}`;
+           if (result.screenshot) {
+              await ctx.replyWithPhoto(
+                { source: result.screenshot },
+                { caption: errMsg, parse_mode: 'Markdown' }
+              );
+           } else {
+              await ctx.reply(errMsg, { parse_mode: 'Markdown' });
+           }
+           return;
+        }
+
+        await ctx.replyWithPhoto(
+          { source: result.screenshot },
+          { caption: '✅ *Rekap Presensi berhasil diambil!*', parse_mode: 'Markdown' }
+        );
+
+      } catch (err) {
+        await safeEdit(ctx, loadingMsg.message_id, 'Error Cek Presensi: ' + err.message);
+      }
+    })();
+  });
+
+  // ─── Flow Cek Daftar Ulang MIS PENS ────────────────────────────────────────
+  bot.hears(['/daftarulang'], async function(ctx) {
+    const userId = String(ctx.from.id);
+    const creds = getCredentials(userId);
+
+    if (!creds) {
+      return ctx.reply(
+        '⚠️ Kredensial belum disimpan.\n\nGunakan perintah /ethollogin untuk menyimpan email dan password secara aman (kredensial ini juga digunakan untuk MIS PENS).',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    const { email, password } = creds;
+    const loadingMsg = await ctx.reply('🚀 Membuka portal Akademik MIS PENS...', { parse_mode: 'Markdown' });
+
+    (async () => {
+      try {
+        const queuePosition = agenticQueue.length;
+        if (agenticQueue.isProcessing) {
+            await safeEdit(ctx, loadingMsg.message_id, `⏳ *Sistem sedang memproses antrean...*\nKamu berada di urutan antrean ke-${queuePosition + 1}. Mohon tunggu sejenak.`, { parse_mode: 'Markdown' });
+        }
+        const { getDaftarUlangMis } = require('../misService');
+        
+        const result = await agenticQueue.enqueue(() => getDaftarUlangMis(email, password, async (text) => {
+           await safeEdit(ctx, loadingMsg.message_id, `🚀 *Status:* ${text}`, { parse_mode: 'Markdown' });
+        }), userId);
+
+        await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+
+        if (!result.success) {
+           let errMsg = `❌ *Gagal Scraping Daftar Ulang:* ${result.error}`;
+           if (result.screenshot) {
+              await ctx.replyWithPhoto(
+                { source: result.screenshot },
+                { caption: errMsg, parse_mode: 'Markdown' }
+              );
+           } else {
+              await ctx.reply(errMsg, { parse_mode: 'Markdown' });
+           }
+           return;
+        }
+
+        if (result.screenshot) {
+            await ctx.replyWithPhoto(
+                { source: result.screenshot },
+                { caption: result.message, parse_mode: 'Markdown' }
+            );
+        } else {
+            await ctx.reply(result.message, { parse_mode: 'Markdown', disable_web_page_preview: true });
+        }
+
+      } catch (err) {
+        await safeEdit(ctx, loadingMsg.message_id, 'Error Cek Daftar Ulang: ' + err.message);
+      }
+    })();
+  });
+
 
   // Daftar Mapel
   bot.hears(['\uD83D\uDCDA Daftar Mapel', '/mapel'], async function(ctx) {
@@ -903,9 +1071,14 @@ function register(bot) {
       (async () => {
         try {
           const answer = await askAI(chatId, text, [], [], async (streamingText) => {
-            await safeEdit(ctx, thinking.message_id, streamingText + ' \u23F3', { parse_mode: 'Markdown' });
+            const safeText = streamingText.length > 4000 ? streamingText.substring(streamingText.length - 3900) + '...' : streamingText;
+            await safeEdit(ctx, thinking.message_id, safeText + ' ⏳', { parse_mode: 'Markdown' });
           });
-          await safeEdit(ctx, thinking.message_id, answer, { parse_mode: 'Markdown' });
+          const chunks = splitText(answer, 4000);
+          await safeEdit(ctx, thinking.message_id, chunks[0], { parse_mode: 'Markdown' });
+          for (let i = 1; i < chunks.length; i++) {
+              await ctx.reply(chunks[i], { parse_mode: 'Markdown' }).catch(()=>{});
+          }
         } catch (err) {
           await safeEdit(ctx, thinking.message_id, 'Error AI: ' + err.message);
         }
@@ -913,17 +1086,99 @@ function register(bot) {
       return;
     }
 
-    const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
     (async () => {
       try {
-        const answer = await askAI(chatId, text, [], [], async (streamingText) => {
-          await safeEdit(ctx, thinking.message_id, streamingText + ' \u23F3', { parse_mode: 'Markdown' });
-        });
-        await safeEdit(ctx, thinking.message_id, answer, { parse_mode: 'Markdown' });
+        const username = ctx.from.first_name || 'Pengguna';
+        const { detectIntentAndChat, askAI } = require('../aiService');
+        const aiResult = await detectIntentAndChat(chatId, text, username);
+
+        if (aiResult.intent && aiResult.intent !== 'none') {
+            const intentNames = {
+                'absen': 'Absen ETHOL',
+                'jadwal': 'Cek Jadwal MIS',
+                'daftarulang': 'Cek Daftar Ulang MIS',
+                'mapel': 'Cek Daftar Mapel',
+                'tugas': 'Kumpulkan Tugas'
+            };
+            const name = intentNames[aiResult.intent] || aiResult.intent;
+            
+            await ctx.reply(`💡 *AI mendeteksi kamu ingin:* **${name}**\n\nApakah kamu ingin mengeksekusi perintah ini?`, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '✅ Ya', callback_data: `intent_exec_${aiResult.intent}_${ctx.from.id}` },
+                        { text: '❌ Batal', callback_data: `intent_cancel_${ctx.from.id}` }
+                    ]]
+                }
+            });
+            return;
+        }
+
+        const isReplyToBot = ctx.message.reply_to_message && ctx.message.reply_to_message.from.id === ctx.botInfo.id;
+        const isMentioningBot = text.includes(`@${ctx.botInfo.username}`);
+        const isPrivate = ctx.chat.type === 'private';
+
+        if (isReplyToBot || isMentioningBot || isPrivate) {
+            // Explicit trigger -> Detailed Assistant Response
+            const thinking = await ctx.reply('\uD83D\uDCAD Sedang berpikir...');
+            try {
+                const answer = await askAI(chatId, text, [], [], async (streamingText) => {
+                    const safeText = streamingText.length > 4000 ? streamingText.substring(streamingText.length - 3900) + '...' : streamingText;
+                    await safeEdit(ctx, thinking.message_id, safeText + ' ⏳', { parse_mode: 'Markdown' });
+                });
+                const chunks = splitText(answer, 4000);
+                await safeEdit(ctx, thinking.message_id, chunks[0], { parse_mode: 'Markdown' });
+                for (let i = 1; i < chunks.length; i++) {
+                    await ctx.reply(chunks[i], { parse_mode: 'Markdown' }).catch(()=>{});
+                }
+            } catch (err) {
+                await safeEdit(ctx, thinking.message_id, 'Orion error: ' + err.message + '\n\nPastikan GEMINI_API_KEY sudah diisi di .env');
+            }
+        } else if (aiResult.chimeIn && aiResult.reply) {
+            // Untriggered -> Spontaneous Nimbrung Response
+            await ctx.telegram.sendMessage(chatId, aiResult.reply, { parse_mode: 'Markdown' });
+        }
       } catch (err) {
-        await safeEdit(ctx, thinking.message_id, 'Orion error: ' + err.message + '\n\nPastikan GEMINI_API_KEY sudah diisi di .env');
+         console.warn('[AI Intent] Error:', err.message);
       }
     })();
+  });
+
+  bot.action(/^intent_exec_([^_]+)_(\d+)$/, async (ctx) => {
+      const intent = ctx.match[1];
+      const originalUserId = ctx.match[2];
+
+      if (ctx.from.id.toString() !== originalUserId) {
+          return ctx.answerCbQuery('❌ Ini bukan untukmu!', { show_alert: true });
+      }
+
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(()=>{});
+      await ctx.answerCbQuery('Mengeksekusi...').catch(()=>{});
+
+      const cmdMap = {
+          'absen': '/absen',
+          'jadwal': '/jadwal',
+          'daftarulang': '/daftarulang',
+          'mapel': '/mapel',
+          'tugas': '/tugas'
+      };
+
+      const cmd = cmdMap[intent];
+      if (cmd) {
+          ctx.message = { text: cmd, from: ctx.from, chat: ctx.chat };
+          bot.handleUpdate({
+              update_id: Date.now(),
+              message: ctx.message
+          });
+      }
+  });
+
+  bot.action(/^intent_cancel_(\d+)$/, async (ctx) => {
+      const originalUserId = ctx.match[1];
+      if (ctx.from.id.toString() !== originalUserId) {
+          return ctx.answerCbQuery('❌ Ini bukan untukmu!', { show_alert: true });
+      }
+      await ctx.editMessageText('✅ Dibatalkan.').catch(()=>{});
   });
 
   async function handleFileUpload(ctx, fileId, fileName, mimeType, caption) {
@@ -1008,9 +1263,14 @@ function register(bot) {
         fs.unlinkSync(tempPath);
 
         const answer = await askAI(chatId, parts, assignmentsObj, courses, async (streamingText) => {
-          await safeEdit(ctx, thinking.message_id, streamingText + ' \u23F3', { parse_mode: 'Markdown' });
+          const safeText = streamingText.length > 4000 ? streamingText.substring(streamingText.length - 3900) + '...' : streamingText;
+          await safeEdit(ctx, thinking.message_id, safeText + ' ⏳', { parse_mode: 'Markdown' });
         });
-        await safeEdit(ctx, thinking.message_id, answer, { parse_mode: 'Markdown' });
+        const chunks = splitText(answer, 4000);
+        await safeEdit(ctx, thinking.message_id, chunks[0], { parse_mode: 'Markdown' });
+        for (let i = 1; i < chunks.length; i++) {
+            await ctx.reply(chunks[i], { parse_mode: 'Markdown' }).catch(()=>{});
+        }
       } catch (err) {
         await safeEdit(ctx, thinking.message_id, 'Error AI memproses file: ' + err.message);
       }
