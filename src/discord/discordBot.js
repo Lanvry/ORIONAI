@@ -8,6 +8,49 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const zlib = require('zlib');
+
+function appendMermaidImages(text) {
+    if (!text || typeof text !== 'string') return text;
+    
+    // Regexp to find mermaid code blocks
+    const regex = /```mermaid\s+([\s\S]*?)```/gi;
+    let match;
+    let appendedLinks = [];
+    let cleanText = text;
+    
+    while ((match = regex.exec(text)) !== null) {
+        const code = match[1].trim();
+        if (!code) continue;
+        
+        try {
+            const state = {
+                code: code,
+                mermaid: { theme: 'default' }
+            };
+            const jsonString = JSON.stringify(state);
+            const compressed = zlib.deflateSync(Buffer.from(jsonString), { level: 9 });
+            const base64 = compressed.toString('base64')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=/g, '');
+            
+            const imageUrl = `https://mermaid.ink/img/pako:${base64}`;
+            appendedLinks.push(imageUrl);
+        } catch (e) {
+            console.error('[Mermaid] Gagal membuat link gambar:', e.message);
+        }
+    }
+    
+    // Hapus blok kode mermaid dari teks asli agar chat tidak kepanjangan
+    cleanText = cleanText.replace(/```mermaid\s+[\s\S]*?```/gi, '').trim();
+    
+    if (appendedLinks.length > 0) {
+        return (cleanText ? cleanText + '\n\n' : '') + '📊 **Render Diagram:**\n' + appendedLinks.join('\n');
+    }
+    
+    return text;
+}
 
 function splitText(text, limit) {
     if (text.length <= limit) return [text];
@@ -133,6 +176,20 @@ function startDiscordBot() {
                 .addStringOption(option => 
                     option.setName('pesan')
                           .setDescription('Apa yang ingin kamu tanyakan?')
+                          .setRequired(true)),
+            new SlashCommandBuilder()
+                .setName('flowchart')
+                .setDescription('Buatkan flowchart / diagram alir otomatis menggunakan format Mermaid')
+                .addStringOption(option => 
+                    option.setName('deskripsi')
+                          .setDescription('Apa yang ingin kamu buat flowchartnya? (misal: stack, queue)')
+                          .setRequired(true)),
+            new SlashCommandBuilder()
+                .setName('draw')
+                .setDescription('Gambarkan sesuatu menggunakan AI (Gemini Imagen 3 / Pollinations AI)')
+                .addStringOption(option => 
+                    option.setName('prompt')
+                          .setDescription('Deskripsi gambar yang ingin dibuat')
                           .setRequired(true)),
             new SlashCommandBuilder()
                 .setName('absen')
@@ -425,16 +482,69 @@ function startDiscordBot() {
                   }, DISCORD_BOT_PERSONA);
                   
                   if (answer) {
-                      if (answer.length > 2000) {
-                          await interaction.editReply(answer.substring(0, 1996) + '...');
+                      const processedAnswer = appendMermaidImages(answer);
+                      if (processedAnswer.length > 2000) {
+                          await interaction.editReply(processedAnswer.substring(0, 1996) + '...');
                       } else {
-                          await interaction.editReply(answer);
+                          await interaction.editReply(processedAnswer);
                       }
                   } else {
                       await interaction.editReply('Maaf, pikiranku sedang buntu saat ini.');
                   }
               } catch (err) {
                   await interaction.editReply(`❌ Error AI: ${err.message}`);
+              }
+          }
+
+          if (interaction.commandName === 'flowchart') {
+              const deskripsi = interaction.options.getString('deskripsi');
+              const userId = interaction.user.id.toString();
+
+              // Kirim indikator bahwa bot sedang memproses (Deferred reply / "Berpikir...")
+              await interaction.deferReply();
+
+              try {
+                  const prompt = `tolong buatkan saya flowchart tentang ${deskripsi}`;
+                  const answer = await askAI(userId, prompt, [], [], async (streamText) => {
+                      try {
+                          if (streamText.length > 0) {
+                              const safeText = streamText.length > 1950 ? streamText.substring(0, 1946) + '...' : streamText;
+                              await interaction.editReply(safeText);
+                          }
+                      } catch (e) {
+                          // ignore rate-limits
+                      }
+                  }, DISCORD_BOT_PERSONA);
+                  
+                  if (answer) {
+                      const processedAnswer = appendMermaidImages(answer);
+                      if (processedAnswer.length > 2000) {
+                          await interaction.editReply(processedAnswer.substring(0, 1996) + '...');
+                      } else {
+                          await interaction.editReply(processedAnswer);
+                      }
+                  } else {
+                      await interaction.editReply('Maaf, pikiranku sedang buntu saat ini.');
+                  }
+              } catch (err) {
+                  await interaction.editReply(`❌ Error AI: ${err.message}`);
+              }
+          }
+
+          if (interaction.commandName === 'draw') {
+              const prompt = interaction.options.getString('prompt');
+              await interaction.deferReply();
+
+              try {
+                  const { generateImage } = require('../aiService');
+                  const imgResult = await generateImage(prompt);
+                  const attachment = new AttachmentBuilder(imgResult.buffer, { name: 'generated.png' });
+                  await interaction.editReply({
+                      content: `🎨 Hasil gambar untuk prompt: **${prompt}**\n*English Prompt: "${imgResult.translatedPrompt}"*`,
+                      files: [attachment]
+                  });
+              } catch (err) {
+                  await interaction.editReply(`❌ Gagal menggambar: ${err.message}`);
               }
           }
       } else if (interaction.isStringSelectMenu()) {
@@ -600,11 +710,60 @@ function startDiscordBot() {
     let userMessage = message.content;
     const username = message.author.username;
 
+    // --- PREFIX COMMANDS FOR IMAGE GENERATION ---
+    const lowerMessage = userMessage.toLowerCase();
+    if (lowerMessage.startsWith('!draw ') || lowerMessage.startsWith('!gambar ')) {
+      const isDraw = lowerMessage.startsWith('!draw ');
+      const prefixLength = isDraw ? 6 : 8;
+      const prompt = userMessage.slice(prefixLength).trim();
+      if (!prompt) {
+        return message.reply('Tuliskan deskripsi gambar setelah perintah! Contoh: `!draw kucing lucu`');
+      }
+      
+      const botMessage = await message.reply('Sedang menggambar, tunggu sebentar... 🎨');
+      try {
+        const { generateImage } = require('../aiService');
+        const imgResult = await generateImage(prompt);
+        const attachment = new AttachmentBuilder(imgResult.buffer, { name: 'generated.png' });
+        await botMessage.edit({
+          content: `🎨 Hasil gambar untuk prompt: **${prompt}**\n*English Prompt: "${imgResult.translatedPrompt}"*`,
+          files: [attachment]
+        });
+      } catch (err) {
+        await botMessage.edit(`❌ Gagal menggambar: ${err.message}`);
+      }
+      return;
+    }
+
     try {
         const { detectIntentAndChat, askAI } = require('../aiService');
         
         // 1. Cek Intent & Chime In (berjalan untuk semua pesan teks)
         const aiResult = await detectIntentAndChat(chatId, userMessage, username);
+
+        // Pengalihan Channel untuk Pertanyaan/Bantuan Akademik & Koding
+        const QUESTION_CHANNEL_ID = process.env.QUESTION_CHANNEL_ID || '1405417907973918730';
+        const FLOWCHART_CHANNEL_ID = process.env.FLOWCHART_CHANNEL_ID || '1426164497420255322';
+        const isQuestionChannel = chatId === QUESTION_CHANNEL_ID;
+        const isFlowchartChannel = chatId === FLOWCHART_CHANNEL_ID;
+        const isServerChannel = !!message.guild;
+
+        // 1. Jika ini permintaan diagram/flowchart, arahkan ke channel khusus flowchart (kecuali jika user sudah di channel flowchart)
+        // [TEMPORARILY DISABLED FOR TESTING]
+        // if (isServerChannel && !isFlowchartChannel && aiResult.isFlowchart) {
+        //     await message.reply({
+        //         content: `💡 Halo kak <@${message.author.id}>! Untuk membuat atau memproses flowchart/diagram, silakan langsung ke channel <#${FLOWCHART_CHANNEL_ID}> ya! Terima kasih 🫡`
+        //     });
+        //     return;
+        // }
+
+        // 2. Jika ini pertanyaan/bantuan akademik lainnya, arahkan ke channel question (kecuali jika user sudah di channel question atau flowchart, dan bukan request flowchart)
+        if (isServerChannel && !isQuestionChannel && !isFlowchartChannel && !aiResult.isFlowchart && (aiResult.isQuestion || (aiResult.intent && aiResult.intent !== 'none'))) {
+            await message.reply({
+                content: `💡 Halo kak <@${message.author.id}>! Untuk bertanya, meminta bantuan koding/akademik, atau menggunakan fitur bot, silakan langsung ke channel <#${QUESTION_CHANNEL_ID}> ya! Terima kasih 🫡`
+            });
+            return;
+        }
 
         if (aiResult.intent && aiResult.intent !== 'none') {
             const intentNames = {
@@ -636,16 +795,17 @@ function startDiscordBot() {
             return;
         }
 
-        // 2. Cek apakah ini pesan EKSPLISIT ke bot (DM, mention, prefix)
+        // 2. Cek apakah ini pesan EKSPLISIT ke bot (DM, mention, prefix, atau di channel khusus)
         const isDirectMessage = !message.guild;
         const isMentioned = message.mentions.has(client.user.id);
         const prefix = '!orion ';
         const hasPrefix = userMessage.toLowerCase().startsWith(prefix);
+        const isInSpecialChannel = isQuestionChannel || isFlowchartChannel || aiResult.isFlowchart;
 
-        if (!isMentioned && !isDirectMessage && !hasPrefix) {
+        if (!isMentioned && !isDirectMessage && !hasPrefix && !isInSpecialChannel) {
             // Jika bukan eksplisit, cek apakah AI mau nimbrung spontan
             if (aiResult.chimeIn && aiResult.reply) {
-                await message.channel.send({ content: aiResult.reply });
+                await message.channel.send({ content: appendMermaidImages(aiResult.reply) });
             }
             return;
         }
@@ -713,7 +873,8 @@ function startDiscordBot() {
                     await botMessage.delete().catch(()=>{});
                     return;
                 }
-                const chunks = splitText(answer, 1950);
+                const processedAnswer = appendMermaidImages(answer);
+                const chunks = splitText(processedAnswer, 1950);
                 let lastMsg = botMessage;
                 await lastMsg.edit(chunks[0]).catch(()=>{});
                 for (let i = 1; i < chunks.length; i++) {
@@ -755,7 +916,8 @@ function startDiscordBot() {
                 await botMessage.delete().catch(()=>{});
                 return;
             }
-            const chunks = splitText(answer, 1950);
+            const processedAnswer = appendMermaidImages(answer);
+            const chunks = splitText(processedAnswer, 1950);
             let lastMsg = botMessage;
             await lastMsg.edit(chunks[0]).catch(()=>{});
             for (let i = 1; i < chunks.length; i++) {
