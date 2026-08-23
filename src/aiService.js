@@ -1144,10 +1144,148 @@ async function generateImage(prompt) {
   }
 }
 
+async function processVoiceQuery(chatId, audioBuffer, customBotPersona = null, mimeType = 'audio/ogg') {
+  const GROQ_API_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_API_KEY) {
+    console.warn('[Voice AI] GROQ_API_KEY tidak dikonfigurasi. Transkripsi suara dinonaktifkan.');
+    return '[IGNORE]';
+  }
+
+  // --- Kirim audio ke Groq Whisper untuk transkripsi ---
+  let rawTranscription = '';
+  try {
+    const FormData = require('form-data');
+    const form = new FormData();
+    form.append('file', audioBuffer, {
+      filename: 'voice.ogg',
+      contentType: mimeType,
+    });
+    form.append('model', 'whisper-large-v3-turbo');
+    form.append('language', 'id'); // Bahasa Indonesia, Whisper otomatis fallback ke en jika tidak cocok
+    form.append('response_format', 'json');
+
+    console.log('[Voice AI] Mengirim audio ke Groq Whisper...');
+    const res = await axios.post(
+      'https://api.groq.com/openai/v1/audio/transcriptions',
+      form,
+      {
+        headers: {
+          ...form.getHeaders(),
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        timeout: 30000,
+      }
+    );
+    rawTranscription = res.data?.text?.trim() || '';
+    console.log(`[Voice AI] Transkripsi Groq Whisper: "${rawTranscription}"`);
+  } catch (err) {
+    console.error('[Voice AI] Groq Whisper gagal:', err.response?.data || err.message);
+    return '[IGNORE]';
+  }
+
+  if (!rawTranscription) return '[IGNORE]';
+
+  // --- Deteksi kata pemicu "pens" secara lokal ---
+  // Normalisasi: lowercase, hilangkan tanda baca di awal
+  const normalized = rawTranscription.toLowerCase().replace(/^[^a-z0-9]+/, '').trim();
+
+  // Kata pemicu: "pens", "pen", "pence", "fence", "fans" (variasi pengucapan)
+  const WAKE_WORDS = ['pens', 'pen ', 'pence', 'fence', 'fans', 'pens,', 'pens.', 'halo pens', 'hey pens', 'hai pens'];
+  const triggered = WAKE_WORDS.some(w => normalized.startsWith(w.toLowerCase()));
+
+  if (!triggered) {
+    console.log('[Voice AI] Kata pemicu tidak terdeteksi, IGNORE.');
+    return '[IGNORE]';
+  }
+
+  // Buang kata pemicu dari awal, ambil sisanya sebagai query
+  let query = rawTranscription;
+  // Cari posisi akhir kata pemicu dalam teks asli (case-insensitive)
+  const wakeWordRegex = /^(halo\s+pens|hey\s+pens|hai\s+pens|pens|pen|pence|fence|fans)[,.\s]*/i;
+  query = query.replace(wakeWordRegex, '').trim();
+
+  if (!query) {
+    // Hanya kata pemicu tanpa pertanyaan
+    console.log('[Voice AI] Kata pemicu terdeteksi tapi tidak ada pertanyaan, balas sapaan singkat.');
+    query = 'Halo! (pengguna memanggil bot via voice channel, balas dengan sapaan singkat yang ramah)';
+  }
+
+  console.log(`[Voice AI] Query diekstrak: "${query}". Meneruskan ke hirarki AI...`);
+
+  // --- Teruskan ke hirarki AI (Gemini → DeepSeek → OpenRouter → OpenCode → Ollama) ---
+  const answer = await askAI(chatId, query, [], [], null, customBotPersona);
+  return answer;
+}
+
+/**
+ * Transkripsi audio ke teks menggunakan Groq Whisper.
+ * @param {Buffer} audioBuffer - Buffer OGG Opus
+ * @returns {Promise<string|null>} teks transkripsi, atau null jika gagal
+ */
+async function transcribeAudio(audioBuffer) {
+  const GROQ_API_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_API_KEY) {
+    console.warn('[Voice AI] GROQ_API_KEY tidak dikonfigurasi.');
+    return null;
+  }
+  try {
+    const FormData = require('form-data');
+    const form = new FormData();
+    form.append('file', audioBuffer, { filename: 'voice.wav', contentType: 'audio/wav' });
+    form.append('model', 'whisper-large-v3-turbo');
+    form.append('language', 'id');
+    form.append('response_format', 'json');
+
+    console.log('[Voice AI] Mengirim audio ke Groq Whisper...');
+    const res = await axios.post('https://api.groq.com/openai/v1/audio/transcriptions', form, {
+      headers: { ...form.getHeaders(), Authorization: `Bearer ${GROQ_API_KEY}` },
+      timeout: 30000,
+    });
+    const text = res.data?.text?.trim() || null;
+    console.log(`[Voice AI] Transkripsi Groq Whisper: "${text}"`);
+    return text;
+  } catch (err) {
+    console.error('[Voice AI] Groq Whisper gagal:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+/**
+ * Deteksi kata pemicu "pens" dari audio dan ekstrak query-nya.
+ * @param {Buffer} audioBuffer - Buffer OGG Opus
+ * @returns {Promise<string|null>}
+ *   - null  → tidak ada kata pemicu
+ *   - ''    → kata pemicu ada tapi tidak ada pertanyaan lanjutan
+ *   - string → pertanyaan setelah kata pemicu
+ */
+async function detectHotwordAndExtract(audioBuffer) {
+  const text = await transcribeAudio(audioBuffer);
+  if (!text) return null;
+
+  // Ubah ke lowercase untuk pencocokan case-insensitive
+  const normalized = text.toLowerCase().trim();
+
+  // Regex pintar untuk mendeteksi variasi kata pemicu (pens, pends, fans, fence, pence, pen, friend, friends)
+  // Cocok jika berada di awal kalimat, atau didahului oleh kata sapaan (halo, hello, hai, hey, eh, oi, hi)
+  const wakeWordRegex = /^(?:halo|hello|hey|hai|eh|oi|hi)?\s*(?:pens|pends|fans|fence|pence|pen|friends|friend)[,.\s]*/i;
+
+  const match = text.match(wakeWordRegex);
+  if (!match) {
+    return null; // Tidak ada kata pemicu
+  }
+
+  // Buang bagian pemicu dari teks asli untuk mendapatkan pertanyaannya
+  const query = text.substring(match[0].length).trim();
+  return query; // Mengembalikan string kosong jika hanya memanggil nama, atau pertanyaan lengkap
+}
+
 module.exports = {
   askAI,
   ringkasAssignment,
   detectIntentAndChat,
-  generateImage
+  generateImage,
+  processVoiceQuery,
+  transcribeAudio,
+  detectHotwordAndExtract,
 };
 

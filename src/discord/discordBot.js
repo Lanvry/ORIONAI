@@ -1,4 +1,5 @@
 const { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder, AttachmentBuilder, ActivityType, MessageFlags, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
+const { joinVoiceChannel, getVoiceConnection, EndBehaviorType } = require('@discordjs/voice');
 const { askAI } = require('../aiService');
 const { getCredentials, saveCredentials } = require('../etholCredentials');
 const { loginAndCheckEthol } = require('../etholService');
@@ -51,6 +52,7 @@ function appendMermaidImages(text) {
     
     return text;
 }
+
 
 function splitText(text, limit) {
     if (text.length <= limit) return [text];
@@ -139,6 +141,9 @@ const DISCORD_BOT_PERSONA = 'Kamu adalah bot representasi PENS Sumenep yang cerd
 
 // --- Antrian Sistem dihapus, pindah ke src/agenticQueue.js ---
 
+// Melacak status dan timeout voice channel per guild
+const voiceGuildStates = new Map();
+
 function startDiscordBot() {
   if (!process.env.DISCORD_BOT_TOKEN) {
       console.warn('⚠️  DISCORD_BOT_TOKEN belum diisi di file .env');
@@ -148,12 +153,198 @@ function startDiscordBot() {
   const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers, // Membaca info member
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages
+        GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.GuildVoiceStates
     ],
     partials: [Partials.Channel]
   });
+
+  async function checkVoiceChannelsForGuild(guild) {
+      try {
+          const guildId = guild.id;
+          if (!voiceGuildStates.has(guildId)) {
+              voiceGuildStates.set(guildId, {
+                  joinTimeout: null,
+                  leaveTimeout: null,
+                  targetChannelId: null
+              });
+          }
+          const state = voiceGuildStates.get(guildId);
+
+          // Ambil threshold dari environment variables dengan fallback default
+          const VOICE_JOIN_THRESHOLD = parseInt(process.env.VOICE_JOIN_THRESHOLD) || 3;
+          const VOICE_LEAVE_THRESHOLD = parseInt(process.env.VOICE_LEAVE_THRESHOLD) || 2;
+
+          // Ambil delay dari environment variables (detik) dengan fallback default
+          const VOICE_JOIN_DELAY_MIN = parseInt(process.env.VOICE_JOIN_DELAY_MIN) || 5;
+          const VOICE_JOIN_DELAY_MAX = parseInt(process.env.VOICE_JOIN_DELAY_MAX) || 15;
+          const VOICE_LEAVE_DELAY_MIN = parseInt(process.env.VOICE_LEAVE_DELAY_MIN) || 5;
+          const VOICE_LEAVE_DELAY_MAX = parseInt(process.env.VOICE_LEAVE_DELAY_MAX) || 15;
+
+          // Dapatkan semua voice channel di guild ini
+          const voiceChannels = guild.channels.cache.filter(c => c.isVoiceBased());
+          
+          let busiestChannel = null;
+          let maxNonBotUsers = 0;
+
+          for (const [channelId, channel] of voiceChannels) {
+              // Hitung jumlah member non-bot di channel ini menggunakan voiceStates cache dengan filter fallback
+              const membersInChannel = guild.voiceStates.cache.filter(vs => {
+                  if (vs.channelId !== channel.id) return false;
+                  if (vs.id === client.user.id) return false;
+                  if (vs.member?.user?.bot) return false;
+                  const cachedUser = client.users.cache.get(vs.id);
+                  if (cachedUser?.bot) return false;
+                  return true;
+              });
+              const count = membersInChannel.size;
+              
+              if (count > maxNonBotUsers) {
+                  maxNonBotUsers = count;
+                  busiestChannel = channel;
+              }
+          }
+
+          console.log(`[Voice Debug] Guild: "${guild.name}", Saluran Tersibuk: "${busiestChannel?.name || 'None'}", Anggota non-bot: ${maxNonBotUsers}`);
+
+          // Cek apakah bot saat ini terhubung di guild ini
+          const currentConnection = getVoiceConnection(guildId);
+          const currentBotChannelId = currentConnection?.joinConfig?.channelId;
+
+          // 1. KONDISI JOIN: Jika ada channel yang mencapai threshold keramaian
+          if (maxNonBotUsers >= VOICE_JOIN_THRESHOLD && busiestChannel) {
+              // Jika bot belum terhubung, atau terhubung di channel yang berbeda dari channel tersibuk
+              if (!currentConnection || currentBotChannelId !== busiestChannel.id) {
+                  // Batalkan leave timeout jika ada karena channel kembali ramai
+                  if (state.leaveTimeout) {
+                      clearTimeout(state.leaveTimeout);
+                      state.leaveTimeout = null;
+                  }
+
+                  // Jika target channel berubah atau belum ada timeout berjalan
+                  if (state.targetChannelId !== busiestChannel.id) {
+                      if (state.joinTimeout) {
+                          clearTimeout(state.joinTimeout);
+                      }
+                      
+                      state.targetChannelId = busiestChannel.id;
+                      
+                      // Hitung delay acak
+                      const randomDelayMs = (Math.random() * (VOICE_JOIN_DELAY_MAX - VOICE_JOIN_DELAY_MIN) + VOICE_JOIN_DELAY_MIN) * 1000;
+                      console.log(`[Voice] Mendeteksi keramaian di "${busiestChannel.name}" di server "${guild.name}" (${maxNonBotUsers} anggota). Bersiap bergabung dalam ${(randomDelayMs / 1000).toFixed(1)} detik...`);
+
+                      state.joinTimeout = setTimeout(() => {
+                          // Double check apakah channel ini masih ramai saat timeout habis
+                          const freshChannel = guild.channels.cache.get(busiestChannel.id);
+                          if (freshChannel) {
+                              const freshNonBotUsers = guild.voiceStates.cache.filter(vs => {
+                                  if (vs.channelId !== freshChannel.id) return false;
+                                  if (vs.id === client.user.id) return false;
+                                  if (vs.member?.user?.bot) return false;
+                                  const cachedUser = client.users.cache.get(vs.id);
+                                  if (cachedUser?.bot) return false;
+                                  return true;
+                              }).size;
+                              if (freshNonBotUsers >= VOICE_JOIN_THRESHOLD) {
+                                  console.log(`[Voice] Bergabung ke saluran suara "${freshChannel.name}" di server "${guild.name}" setelah delay.`);
+                                  const newConnection = joinVoiceChannel({
+                                      channelId: freshChannel.id,
+                                      guildId: guild.id,
+                                      adapterCreator: guild.voiceAdapterCreator,
+                                      selfDeaf: true, // deaf bot agar tidak memakan bandwidth untuk mendengar
+                                      selfMute: true  // mute bot agar tidak bersuara
+                                  });
+                                  
+                                  newConnection.on('stateChange', (oldState, newState) => {
+                                      console.log(`[Voice Connection] Status berubah dari "${oldState.status}" ke "${newState.status}" di server "${guild.name}"`);
+                                  });
+                                  newConnection.on('error', (error) => {
+                                      console.error(`[Voice Connection Error] Error di server "${guild.name}":`, error.message);
+                                  });
+                              } else {
+                                  console.log(`[Voice] Batal bergabung ke "${freshChannel.name}" karena jumlah anggota berkurang sebelum bot sempat masuk.`);
+                              }
+                          }
+                          state.joinTimeout = null;
+                          state.targetChannelId = null;
+                      }, randomDelayMs);
+                  }
+              }
+          } 
+          // 2. KONDISI LEAVE: Jika bot terhubung, tapi channel bot saat ini sepi
+          else if (currentConnection && currentBotChannelId) {
+              // Batalkan join timeout jika ada
+              if (state.joinTimeout) {
+                  clearTimeout(state.joinTimeout);
+                  state.joinTimeout = null;
+                  state.targetChannelId = null;
+              }
+
+              const botChannel = voiceChannels.get(currentBotChannelId);
+              if (botChannel) {
+                  const nonBotMembers = guild.voiceStates.cache.filter(vs => {
+                      if (vs.channelId !== botChannel.id) return false;
+                      if (vs.id === client.user.id) return false;
+                      if (vs.member?.user?.bot) return false;
+                      const cachedUser = client.users.cache.get(vs.id);
+                      if (cachedUser?.bot) return false;
+                      return true;
+                  });
+                  
+                  if (nonBotMembers.size < VOICE_LEAVE_THRESHOLD) {
+                      // Mulai leave timeout jika belum ada
+                      if (!state.leaveTimeout) {
+                          const randomDelayMs = (Math.random() * (VOICE_LEAVE_DELAY_MAX - VOICE_LEAVE_DELAY_MIN) + VOICE_LEAVE_DELAY_MIN) * 1000;
+                          console.log(`[Voice] Saluran suara "${botChannel.name}" sepi (${nonBotMembers.size} anggota). Bersiap meninggalkan dalam ${(randomDelayMs / 1000).toFixed(1)} detik...`);
+
+                          state.leaveTimeout = setTimeout(() => {
+                              // Double check apakah channel bot masih sepi saat timeout habis
+                              const freshConnection = getVoiceConnection(guildId);
+                              if (freshConnection) {
+                                  const freshBotChannelId = freshConnection.joinConfig.channelId;
+                                  const freshChannel = guild.channels.cache.get(freshBotChannelId);
+                                  if (freshChannel) {
+                                      const freshNonBotUsers = guild.voiceStates.cache.filter(vs => {
+                                          if (vs.channelId !== freshChannel.id) return false;
+                                          if (vs.id === client.user.id) return false;
+                                          if (vs.member?.user?.bot) return false;
+                                          const cachedUser = client.users.cache.get(vs.id);
+                                          if (cachedUser?.bot) return false;
+                                          return true;
+                                      }).size;
+                                      if (freshNonBotUsers < VOICE_LEAVE_THRESHOLD) {
+                                          console.log(`[Voice] Meninggalkan saluran suara "${freshChannel.name}" di server "${guild.name}" setelah delay.`);
+                                          freshConnection.destroy();
+                                      } else {
+                                          console.log(`[Voice] Batal meninggalkan "${freshChannel.name}" karena mendadak ramai kembali.`);
+                                      }
+                                  } else {
+                                      freshConnection.destroy();
+                                  }
+                              }
+                              state.leaveTimeout = null;
+                          }, randomDelayMs);
+                      }
+                  } else {
+                      // Jika mendadak ramai lagi sebelum timeout habis, batalkan leave
+                      if (state.leaveTimeout) {
+                          console.log(`[Voice] Batal meninggalkan "${botChannel.name}" karena ada anggota baru masuk.`);
+                          clearTimeout(state.leaveTimeout);
+                          state.leaveTimeout = null;
+                      }
+                  }
+              } else {
+                  // Fallback jika channel bot tidak ditemukan
+                  currentConnection.destroy();
+              }
+          }
+      } catch (err) {
+          console.error('[Voice Check Error]:', err.message);
+      }
+  }
 
   client.once('clientReady', async () => {
     console.log(`✅ Discord Bot Berhasil Login sebagai ${client.user.tag}`);
@@ -255,6 +446,12 @@ function startDiscordBot() {
             console.error(`❌ Gagal daftarkan command di guild ${guild.name}: ${err.message}`);
         }
     });
+
+    // Jalankan scan saluran suara pertama kali di setiap server saat bot siap
+    console.log('🔍 Melakukan pemeriksaan awal saluran suara di seluruh server...');
+    for (const [guildId, guild] of client.guilds.cache) {
+        checkVoiceChannelsForGuild(guild);
+    }
   });
 
   // --- Penanganan Interactions ---
@@ -932,6 +1129,15 @@ function startDiscordBot() {
       console.warn('[Discord messageCreate] Global Error:', globalErr.message);
   }
 });
+
+  // ─── Penanganan Auto-Join & Leave Voice Channel ────────────────────────────
+  client.on('voiceStateUpdate', async (oldState, newState) => {
+      console.log(`[Voice Debug] voiceStateUpdate terpicu! User: ${newState.member?.user?.tag || oldState.member?.user?.tag || 'Unknown'}`);
+      const guild = newState.guild || oldState.guild;
+      if (guild) {
+          await checkVoiceChannelsForGuild(guild);
+      }
+  });
 
   // Login — DNS failure transient, discord.js auto-retry
   client.login(process.env.DISCORD_BOT_TOKEN).catch(err => {
