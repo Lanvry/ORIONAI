@@ -10,10 +10,18 @@ const GEMINI_KEYS = [];
 
 function initGeminiKeys() {
   if (GEMINI_KEYS.length > 0) return;
-  if (process.env.GEMINI_API_KEY) GEMINI_KEYS.push(process.env.GEMINI_API_KEY);
-  if (process.env.GEMINI_API_KEY_2) GEMINI_KEYS.push(process.env.GEMINI_API_KEY_2);
-  if (process.env.GEMINI_API_KEY_3) GEMINI_KEYS.push(process.env.GEMINI_API_KEY_3);
+  const rawKeys = [
+    process.env.GEMINI_API_KEY,
+    process.env.GEMINI_API_KEY_2,
+    process.env.GEMINI_API_KEY_3,
+  ];
+  for (const k of rawKeys) {
+    if (k && typeof k === 'string' && k.trim().startsWith('AIzaSy')) {
+      GEMINI_KEYS.push(k.trim());
+    }
+  }
 }
+
 
 // ─── AI Chat & Fallback ─────────────────────────────────────────────
 const chatHistories = {};
@@ -46,9 +54,10 @@ async function askOpenCodeGLM(chatId, userParts, systemInstruction, pastHistory,
   }
 
   if (hasImage) {
-    throw new Error('OpenCode GLM-4 tidak mendukung input gambar.');
+    throw new Error('OpenCode tidak mendukung input gambar.');
   }
 
+  // Susun histori percakapan
   let historyText = '';
   if (pastHistory && pastHistory.length > 0) {
     historyText += '--- RIWAYAT CHAT ---\n';
@@ -59,27 +68,77 @@ async function askOpenCodeGLM(chatId, userParts, systemInstruction, pastHistory,
     }
     historyText += '--------------------\n\n';
   }
-  
-  // Sisipkan system instruction INLINE biar model ga bisa ignore
+
   const finalPrompt = systemInstruction + '\n\n' + historyText + 'User: ' + textPrompt;
-  const url = `https://api.opencode.biz.id/api/ai/gptoss120b?prompt=${encodeURIComponent(finalPrompt)}&temperature=0.7`;
 
-  if (onStream) onStream('Waiting for response...');
+  // === OPENCODE ZEN (pakai API key) ===
+  const zenApiKey = process.env.OPENCODE_API_KEY;
+  if (zenApiKey && zenApiKey.trim().length > 0) {
+    // Model verified 200 dari live API test pada 24 Aug 2026
+    const ZEN_FREE_MODELS = [
+      'mimo-v2.5-free',               // ✅ HTTP 200 — Xiaomi
+      'hy3-free',                     // ✅ HTTP 200 — Stealth ringan
+      'laguna-s-2.1-free',            // ✅ HTTP 200 — Stealth/Poolside
+      'x-preview-f-free',             // Fallback
+      'nemotron-3.5-lightning-free',  // Fallback NVIDIA
+      'nemotron-3-ultra-free',        // Fallback NVIDIA
+    ];
 
-  const response = await axios.get(url, { timeout: 10000 });
-  const responseData = response.data;
-  if (responseData) {
-    if (responseData.status === true && responseData.data && responseData.data.response) {
-      return responseData.data.response;
+    const messages = [
+      { role: 'system', content: systemInstruction },
+      ...(pastHistory || []).map(m => ({
+        role: m.role === 'model' ? 'assistant' : 'user',
+        content: m.parts.map(p => p.text).join('\n')
+      })),
+      { role: 'user', content: textPrompt }
+    ];
+
+    for (const zenModel of ZEN_FREE_MODELS) {
+      try {
+        console.log(`[AI] Mencoba OpenCode Zen model: ${zenModel}...`);
+        if (onStream) onStream(`Connecting to OpenCode Zen (${zenModel})...`);
+
+        const zenResponse = await axios.post('https://opencode.ai/zen/v1/chat/completions', {
+          model: zenModel,
+          messages,
+          max_tokens: 2048,
+          temperature: 0.7
+        }, {
+          headers: {
+            'Authorization': `Bearer ${zenApiKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 20000
+        });
+
+        // Parsing fleksibel — beberapa model Zen punya format response yang sedikit beda
+        const data = zenResponse.data;
+        const content =
+          data?.choices?.[0]?.message?.content ||
+          data?.choices?.[0]?.text ||
+          data?.message?.content ||
+          data?.content ||
+          data?.response;
+
+        if (content && content.trim().length > 0) {
+          console.log(`[AI] OpenCode Zen ${zenModel} berhasil!`);
+          return content.trim();
+        }
+        console.warn(`[AI] OpenCode Zen ${zenModel}: response kosong, coba model berikutnya.`);
+      } catch (zenErr) {
+        const status = zenErr.response?.status;
+        const errMsg = zenErr.response?.data?.error?.message || zenErr.message;
+        if (status === 401) {
+          console.warn(`[AI] OpenCode Zen ${zenModel}: model tidak didukung atau auth gagal (401). Coba model berikutnya.`);
+          break;
+        }
+        console.warn(`[AI] OpenCode Zen ${zenModel} gagal [${status || 'ERR'}]: ${errMsg?.slice(0, 80)}`);
+      }
     }
-    if (responseData.response) {
-      return responseData.response;
-    }
-    if (responseData.data && typeof responseData.data === 'string') {
-      return responseData.data;
-    }
+    throw new Error('Semua model OpenCode Zen gagal atau API Key memerlukan setup billing.');
   }
-  throw new Error('Respons tidak valid dari OpenCode.');
+
+  throw new Error('OPENCODE_API_KEY belum diisi di .env.');
 }
 
 function isCodingRequest(text) {
@@ -223,12 +282,23 @@ async function askOllama(chatId, userParts, systemInstruction, pastHistory, onSt
 // Daftar model OpenRouter (urutan prioritas, fallback otomatis jika 404/error)
 const OPENROUTER_MODELS = [
   process.env.OPENROUTER_MODEL,
+  'stealth/ox-alpha',                                    // ✅ OX Alpha — terbukti bekerja
+  // Provider berbeda agar rate limit tidak cascade
+  'google/gemma-4-31b-it:free',                          // Google Gemma 4
+  'google/gemma-4-26b-a4b-it:free',                      // Google Gemma 4 small
+  'liquid/lfm-2.5-2.6b:free',                            // Liquid AI
+  'z-ai/glm-5.2:free',                                   // ZAI
+  'cohere/north-mini-code:free',                         // Cohere
+  'poolside/laguna-xs-2.1:free',                         // Poolside XS
+  'poolside/laguna-s-2.1:free',                          // Poolside S
+  'nvidia/nemotron-3-super-120b-a12b:free',              // NVIDIA
+  'nvidia/nemotron-3.5-lightning:free',                  // NVIDIA
+  'nvidia/nemotron-3-ultra-550b-a55b:free',              // NVIDIA
   'openrouter/free',
-  'google/gemma-4-31b-it:free',
-  'meta-llama/llama-3.1-8b-instruct:free',
-  'google/gemma-3-12b-it:free',
-  'deepseek/deepseek-v4-flash:free',
 ].filter(Boolean);
+
+// Map untuk melacak model yang sedang cooldown akibat 429 (persist selama proses hidup)
+const modelCooldowns = new Map();
 
 async function callOpenRouterWithModel(model, messages, apiKey, onStream) {
   const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
@@ -336,42 +406,130 @@ async function askOpenRouter(chatId, userParts, systemInstruction, pastHistory, 
 
   messages.push({ role: 'user', content: currentUserContent });
 
-  let lastError = null;
-  for (let i = 0; i < OPENROUTER_MODELS.length; i++) {
-    const model = OPENROUTER_MODELS[i];
-    try {
-      console.log(`[AI] Mencoba OpenRouter model: ${model}...`);
-      const result = await callOpenRouterWithModel(model, messages, apiKey, onStream);
-      if (result && result.trim().length > 0) return result;
-      console.warn(`[AI] OpenRouter model ${model} menghasilkan respons kosong, mencoba model berikutnya...`);
-    } catch (err) {
-      const statusCode = err.response && err.response.status;
-      const is429 = statusCode === 429;
-      const is404 = statusCode === 404 || (err.message && err.message.includes('404'));
+  // ── Sistem cooldown per-model ────────────────────────────────────────────────
+  // Model yang kena 429 diblokir sementara selama COOLDOWN_MS agar tidak di-spam.
+  // 'modelCooldowns' adalah Map bersama di closure module ini.
+  const now = () => Date.now();
 
-      if (is404) {
-        console.warn(`[AI] OpenRouter model "${model}" tidak ditemukan (404), mencoba model berikutnya...`);
+  let lastError = null;
+  const MAX_ATTEMPTS = 3; // Maksimum 3 kali coba semua model yang tersedia
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // Ambil model yang belum cooldown
+    const available = OPENROUTER_MODELS.filter(m => {
+      const until = modelCooldowns.get(m);
+      return !until || now() > until;
+    });
+
+    if (available.length === 0) {
+      // Semua model sedang cooldown — cari cooldown terdekat yang selesai
+      const soonest = Math.min(...[...modelCooldowns.values()]);
+      const waitMs = Math.max(soonest - now() + 200, 1000);
+      console.warn(`[AI] Semua model OpenRouter sedang cooldown. Menunggu ${Math.round(waitMs/1000)}s...`);
+      await new Promise(r => setTimeout(r, waitMs));
+      continue;
+    }
+
+    for (const model of available) {
+      try {
+        console.log(`[AI] Mencoba OpenRouter model: ${model}...`);
+        const result = await callOpenRouterWithModel(model, messages, apiKey, onStream);
+        if (result && result.trim().length > 0) return result;
+        console.warn(`[AI] OpenRouter/${model} respons kosong, coba model berikutnya...`);
+      } catch (err) {
+        const statusCode = err.response && err.response.status;
         lastError = err;
+
+        if (statusCode === 401) {
+          throw new Error('OpenRouter API Key tidak valid (401).');
+        }
+        if (statusCode === 429) {
+          // Set cooldown 60 detik untuk model ini
+          modelCooldowns.set(model, now() + 60_000);
+          console.warn(`[AI] ${model} kena rate limit (429). Cooldown 60s.`);
+        } else {
+          console.warn(`[AI] ${model} gagal [${statusCode || 'ERR'}]: ${err.message}`);
+        }
         continue;
       }
+    }
 
-      if (is429) {
-        if (i === 0 && OPENROUTER_MODELS.length > 1) {
-          console.warn(`[AI] OpenRouter rate limit (429), mencoba model berikutnya...`);
-          lastError = err;
-          continue;
-        }
-        throw new Error('Terlalu banyak permintaan ke OpenRouter (Rate limit tercapai).');
-      }
-
-      lastError = err;
-      console.warn(`[AI] OpenRouter model "${model}" error: ${err.message}`);
-      // Jika bukan 404/429, langsung lempar error (misal: auth error)
-      if (!is404 && !is429) break;
+    if (attempt < MAX_ATTEMPTS) {
+      console.warn(`[AI] Semua model gagal (attempt ${attempt}/${MAX_ATTEMPTS}). Retry dalam 5s...`);
+      await new Promise(r => setTimeout(r, 5000));
     }
   }
 
-  throw new Error(`OpenRouter gagal (semua model dicoba): ${lastError ? lastError.message : 'Unknown error'}`);
+  throw new Error(`OpenRouter gagal: ${lastError ? lastError.message : 'semua model tidak responsif'}`);
+}
+
+// ─── Groq API (OpenAI-compatible, GRATIS & SUPER CEPAT) ─────────────────────
+const GROQ_MODELS = [
+  'qwen/qwen3.6-27b',             // ✅ HTTP 200 — Qwen 3.6 27B on Groq LPU
+  'groq/compound-mini',           // ✅ HTTP 200 — Groq Compound Mini
+  'groq/compound',                // ✅ HTTP 200 — Groq Compound
+  'openai/gpt-oss-20b',           // ✅ HTTP 200 — GPT OSS 20B
+  'allam-2-7b',                   // ✅ HTTP 200 — Allam 2 7B
+];
+
+
+async function askGroq(chatId, userParts, systemInstruction, pastHistory, onStream) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('GROQ_API_KEY tidak ada di .env');
+
+  let textPrompt = '';
+  if (typeof userParts === 'string') textPrompt = userParts;
+  else if (Array.isArray(userParts)) {
+    for (const p of userParts) {
+      if (typeof p === 'string') textPrompt += p + '\n';
+      else if (p.text) textPrompt += p.text + '\n';
+      else if (p.inlineData) textPrompt += '[gambar] ';
+    }
+  }
+
+  const messages = [{ role: 'system', content: systemInstruction }];
+  for (const msg of pastHistory) {
+    messages.push({
+      role: msg.role === 'model' ? 'assistant' : 'user',
+      content: msg.parts.map(p => p.text).join('\n'),
+    });
+  }
+  messages.push({ role: 'user', content: textPrompt.trim() });
+
+  let lastErr = null;
+  for (const model of GROQ_MODELS) {
+    try {
+      console.log(`[AI] Mencoba Groq model: ${model}...`);
+      const response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+        model,
+        messages,
+        temperature: 0.7,
+        max_tokens: 2048,
+        stream: false,
+      }, {
+        timeout: 30000,
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      const text = response.data?.choices?.[0]?.message?.content || '';
+      if (text.trim()) {
+        if (onStream) onStream(text);
+        return text;
+      }
+    } catch (err) {
+      lastErr = err;
+      const code = err.response?.status;
+      if (code === 401) throw new Error('Groq API Key tidak valid (401).');
+      if (code === 429) {
+        console.warn(`[AI] Groq/${model} rate limit (429), coba model berikutnya...`);
+        continue;
+      }
+      console.warn(`[AI] Groq/${model} gagal [${code || 'ERR'}]: ${err.message}`);
+    }
+  }
+  throw new Error(`Groq gagal semua model: ${lastErr?.message || 'unknown'}`);
 }
 
 // ─── DeepSeek API (OpenAI-compatible) ────────────────────────────────────────
@@ -461,10 +619,12 @@ async function askDeepSeek(chatId, userParts, systemInstruction, pastHistory, on
   });
 }
 
-// Model Gemini yang digunakan
+// Model Gemini yang digunakan (gemini-2.5-flash paling stabil & quota terpisah)
 const GEMINI_MODELS = [
+  'gemini-2.5-flash',
   'gemini-flash-latest',
 ];
+
 
 async function askGeminiWithModel(apiKey, model, chatId, userMessage, systemInstructionText, pastHistory, onStream) {
   const contents = [];
@@ -502,10 +662,10 @@ async function askGeminiWithModel(apiKey, model, chatId, userMessage, systemInst
     generationConfig: { maxOutputTokens: 2048, temperature: 0.7 }
   };
 
-  // Connection timeout: 25 detik untuk handshake awal
+  // Connection timeout: 7 detik untuk handshake awal (jika lambat berarti API down/throttled)
   // Setelah koneksi terbuka, data langsung distream tanpa dibatasi
   const response = await axios.post(url, payload, {
-    timeout: 25000,
+    timeout: 7000,
     responseType: 'stream',
     httpsAgent: geminiHttpsAgent  // SSL verify false
   });
@@ -515,9 +675,9 @@ async function askGeminiWithModel(apiKey, model, chatId, userMessage, systemInst
     let lastEditTime = 0;
     let partialChunk = '';
 
-    // Idle timeout: jika stream terbuka tapi TIDAK ada data masuk selama 3 menit
+    // Idle timeout: jika stream terbuka tapi TIDAK ada data masuk selama 15 detik
     // → berarti Gemini stuck, pindah ke key berikutnya
-    const IDLE_TIMEOUT_MS = 3 * 60 * 1000; // 3 menit
+    const IDLE_TIMEOUT_MS = 15000; // 15 detik
     let idleTimer = null;
 
     const resetIdleTimer = () => {
@@ -669,10 +829,10 @@ async function askAI(chatId, userMessage, assignmentsObj = [], courses = [], onS
           systemInstructionText = customBotPersona + '\n\n' + memoryContext + '\n\n' + tugasContext;
       } else {
           systemInstructionText = 'Kamu adalah Orion, asisten AI pribadi mahasiswa yang cerdas, seru, dan asik.\n\n' +
-            'Instruksi Gaya Bahasa:\n' +
-            '1. Gunakan bahasa gaul anak tongkrongan IT (misal: lu, gw, bang). Jadilah asik dan ringkas. Boleh basa-basi sedikit atau pakai "wkwk/njir" HANYA jika konteksnya memang sedang bercanda kocak. Jangan terlalu sering (spam) kata seru tersebut agar tidak buang token.\n' +
-            '2. Berikan jawaban yang **jelas, detail, dan seru**.\n' +
+            '1. Gunakan bahasa gaul anak tongkrongan IT (misal: lu, gw, bang). Jadilah asik dan ringkas.\n' +
+            '2. ⚡ ATURAN PANJANG PESAN: JAWAB RINGKAS DAN SINGKAT (1 sampai 2 kalimat saja, maksimal 3 kalimat pendek). JANGAN MENULIS PARAGRAF PANJANG ATAU ESAI untuk obrolan biasa di chat!\n' +
             '3. JANGAN mengulang pertanyaan user.\n' +
+
             '4. Sisipkan emoji secukupnya biar makin hidup.\n' +
             '5. Gunakan format tebal (bold) untuk poin penting.\n' +
             '6. Jika user membalas obrolan biasa (misal "oke mantap"), balaslah dengan SANGAT SINGKAT dan tiru persis gaya ketik mereka.\n' +
@@ -723,9 +883,39 @@ async function askAI(chatId, userMessage, assignmentsObj = [], courses = [], onS
     }
   }
 
-  // 2. Coba DeepSeek (Jika API key tersedia)
+  // 2. Coba OpenCode Zen (langsung setelah Gemini)
+  if (process.env.OPENCODE_API_KEY || true) { // selalu coba (ada free fallback juga)
+    console.warn('[AI] Gemini gagal. Mencoba OpenCode...');
+    try {
+      let openCodeAnswer = await askOpenCodeGLM(chatId, finalUserMessage, systemInstructionText, pastHistory, onStream);
+      if (openCodeAnswer && openCodeAnswer.trim().length > 0) {
+        openCodeAnswer = processAndSave(openCodeAnswer);
+        saveHistory(chatId, finalUserMessage, openCodeAnswer);
+        return openCodeAnswer;
+      }
+    } catch (errOpenCode) {
+      console.warn('[AI] OpenCode error:', errOpenCode.message);
+    }
+  }
+
+  // 3. Coba Groq (Gratis, super cepat — LPU inference)
+  if (process.env.GROQ_API_KEY) {
+    console.warn('[AI] Mencoba Groq...');
+    try {
+      let groqAnswer = await askGroq(chatId, finalUserMessage, systemInstructionText, pastHistory, onStream);
+      if (groqAnswer && groqAnswer.trim().length > 0) {
+        groqAnswer = processAndSave(groqAnswer);
+        saveHistory(chatId, finalUserMessage, groqAnswer);
+        return groqAnswer;
+      }
+    } catch (errGroq) {
+      console.warn('[AI] Groq error:', errGroq.message);
+    }
+  }
+
+  // 4. Coba DeepSeek (Jika API key tersedia)
   if (process.env.DEEPSEEK_API_KEY) {
-    console.warn('[AI] Gemini direct gagal. Mencoba DeepSeek...');
+    console.warn('[AI] Mencoba DeepSeek...');
     try {
       let deepseekAnswer = await askDeepSeek(chatId, finalUserMessage, systemInstructionText, pastHistory, onStream);
       if (deepseekAnswer && deepseekAnswer.trim().length > 0) {
@@ -738,7 +928,7 @@ async function askAI(chatId, userMessage, assignmentsObj = [], courses = [], onS
     }
   }
 
-  // 3. Coba OpenRouter (Tersedia free model cerdas di cloud)
+  // 4. Coba OpenRouter (Tersedia free model cerdas di cloud)
   if (process.env.OPENROUTER_API_KEY) {
     console.warn('[AI] Mencoba OpenRouter...');
     try {
@@ -751,19 +941,6 @@ async function askAI(chatId, userMessage, assignmentsObj = [], courses = [], onS
     } catch (errOpenRouter) {
       console.warn('[AI] OpenRouter error:', errOpenRouter.message);
     }
-  }
-
-  // 4. Coba OpenCode
-  console.warn('[AI] Mencoba OpenCode...');
-  try {
-    let openCodeAnswer = await askOpenCodeGLM(chatId, finalUserMessage, systemInstructionText, pastHistory, onStream);
-    if (openCodeAnswer && openCodeAnswer.trim().length > 0) {
-      openCodeAnswer = processAndSave(openCodeAnswer);
-      saveHistory(chatId, finalUserMessage, openCodeAnswer);
-      return openCodeAnswer;
-    }
-  } catch (errOpenCode) {
-    console.warn('[AI] OpenCode error:', errOpenCode.message);
   }
 
   // 5. Coba Ollama (Model Lokal) sebagai cadangan terakhir
@@ -869,6 +1046,7 @@ Tugasmu:
 1. INTENT RECOGNITION: Deteksi jika user ingin memicu fitur (absen, jadwal, daftarulang, mapel, tugas). Jika tidak, set "none".
 2. NIMBRUNG (Spontaneous Reply): Jika intent "none", putuskan apa kamu mau membalas. 
 SYARAT NIMBRUNG & BALASAN:
+- **KHUSUS DIRECT MESSAGE (DM / Private Chat):** Kamu WAJIB SELALU membalas (set "chimeIn": true) untuk SELURUH pesan di DM tanpa terkecuali, termasuk sapaan singkat seperti "halo", "hai", "p", "ping", dll. JANGAN PERNAH set "chimeIn": false saat di DM!
 - Jika user mengirim ERROR LOG, KODE PROGRAM, atau MINTA BANTUAN IT/KODING, kamu WAJIB menjawab (set "chimeIn": true) dengan **SOLUSI/ANALISA YANG SANGAT JELAS DAN MEMBANTU**. 
 - Jika obrolan memanggil/menyinggung namamu (orion/bot/pens/ai), ATAU ada kata "kau/kamu/lu" yang mengarah padamu, ATAU ada ancaman lucu (misal ddos, hack), WAJIB jawab (set "chimeIn": true).
 - **PENGECUALIAN PENTING:** Jika pesan memanggil/nge-tag orang lain (misal ada "@namaorang") dan TIDAK memanggil namamu, berarti kata "kau/lu" ditujukan untuk orang tersebut.
@@ -877,7 +1055,15 @@ SYARAT NIMBRUNG & BALASAN:
 - **SPONTANITAS (Nyeletuk Bebas):** Jika obrolan antar user sedang seru, lucu, atau menarik, kamu PUNYA KEBEBASAN (Reflek AI) untuk ikut nyeletuk/nimbrung walaupun kamu TIDAK DIPANGGIL. Kadang-kadang nimbrunglah secara acak dengan asik (set "chimeIn": true), atau pilih nyimak saja jika obrolan membosankan (set "chimeIn": false).
 3. CLASSIFICATION (isQuestion): Klasifikasikan apakah pesan user berkonotasi serius untuk bertanya (akademik, bantuan IT, minta carikan tugas, minta penjelasan coding, dll.). Jika ya, set "isQuestion": true. Jika hanya sapaan ramah, bercanda, ketawa-tawa (wkwk, haha), obrolan ringan tidak penting, atau ejekan santai, set "isQuestion": false.
 4. CLASSIFICATION (isFlowchart): Klasifikasikan apakah pesan user secara spesifik meminta pembuatan, desain, penjelasan, atau perbaikan diagram alir/flowchart/mindmap/sequence diagram/visual graph (menggunakan mermaid atau diagram lainnya). Jika ya, set "isFlowchart": true. Jika tidak, set "isFlowchart": false.
-5. DATA MEMORY: Jika dalam chat ada ilmu, informasi berharga, atau fakta penting, simpan ke "saves". Jika tidak ada, biarkan array kosong.
+5. DATA MEMORY (SANGAT PENTING — Berlaku bahkan saat kamu DIAM/STANDBY):
+   Kamu selalu "nyimak" semua obrolan seperti anggota grup yang cerdas. Meski kamu tidak ikut membalas, kamu harus menangkap & menyimpan SEMUA informasi berharga ke "saves".
+   Yang WAJIB disimpan:
+   - Nama/identitas seseorang ("si A ternyata anak informatika angkatan 2023")
+   - Fakta teknis/akademis ("deadline tugas Pak Eko hari Jumat", "server PENS down tadi pagi")
+   - Preferensi/kebiasaan user ("si B suka debug pake print", "lanvry mainnya ML")
+   - Informasi penting dari grup (acara, pengumuman, jadwal, masalah yang diselesaikan)
+   - Pengetahuan IT/coding yang dibahas ("ternyata cara fix error X adalah Y")
+   Jika tidak ada info berharga, biarkan array kosong.
 
 Output JSON:
 {
@@ -920,7 +1106,7 @@ Output JSON:
       generationConfig: { responseMimeType: "application/json", temperature: 0.8 }
     };
     try {
-        const response = await axios.post(url, payload, { timeout: 15000, httpsAgent: geminiHttpsAgent });
+        const response = await axios.post(url, payload, { timeout: 5000, httpsAgent: geminiHttpsAgent });
         if (response.data && response.data.candidates && response.data.candidates[0].content) {
             return parseResult(response.data.candidates[0].content.parts[0].text);
         }
@@ -964,24 +1150,8 @@ Output JSON:
       }
   }
 
-  // 4. Coba OpenCode
-  try {
-      const response = await axios.get('https://api.opencode.biz.id/api/ai/gpt4', {
-          params: { prompt: prompt + '\n\nIMPORTANT: OUTPUT ONLY PURE JSON, NO TEXT BEFORE OR AFTER!' },
-          timeout: 15000
-      });
-      const responseData = response.data;
-      if (responseData) {
-          if (responseData.data) {
-              return parseResult(responseData.data);
-          }
-          if (responseData.response) {
-              return parseResult(responseData.response);
-          }
-      }
-  } catch (err) {}
-
-  // 5. Coba Ollama (Model Lokal) sebagai cadangan terakhir
+  // 4. Fallback default jika semua AI intent gagal
+  return { intent: "none", chimeIn: true, reply: null, isQuestion: false, isFlowchart: false, saves: [] };
   const enableOllama = process.env.ENABLE_OLLAMA === 'true' || !!process.env.OLLAMA_MODEL;
   if (enableOllama) {
       try {
@@ -1279,6 +1449,10 @@ async function detectHotwordAndExtract(audioBuffer) {
   return query; // Mengembalikan string kosong jika hanya memanggil nama, atau pertanyaan lengkap
 }
 
+function addHistory(chatId, userMessage, aiResponse) {
+  saveHistory(chatId, userMessage, aiResponse);
+}
+
 module.exports = {
   askAI,
   ringkasAssignment,
@@ -1287,5 +1461,7 @@ module.exports = {
   processVoiceQuery,
   transcribeAudio,
   detectHotwordAndExtract,
+  addHistory,
+  askOpenRouter,
 };
 

@@ -141,7 +141,7 @@ async function loginAndCheckEthol(email, password, onProgress, mode = 'scan', ta
     // networkidle2 sering hang di portal yang terus-menerus polling network (AJAX)
     // 'load' = tunggu sampai event 'load' browser, jauh lebih reliable & cepat
     await page.goto(
-      'https://login.pens.ac.id/cas/login?service=http%3A%2F%2Fethol.pens.ac.id%2Fcas%2F',
+      'https://login.pens.ac.id/cas/login?service=https%3A%2F%2Fethol.pens.ac.id%2Fapi%2Fauth%2Fcas-callback',
       { waitUntil: 'load', timeout: 45000 }
     );
     console.log('[ETHOL] Page loaded. URL:', page.url());
@@ -211,79 +211,40 @@ async function loginAndCheckEthol(email, password, onProgress, mode = 'scan', ta
     });
 
     if (onProgress) onProgress('📸 Membuka Dashboard ETHOL...');
-
-
-    // Heuristik: Mencoba mengikuti alur user
-    // 1. Pencet notifikasi
-    await page.evaluate(() => {
-      const bells = Array.from(document.querySelectorAll('.fa-bell, [class*="bell"], .dropdown-toggle'));
-      if (bells.length > 0) bells[0].click();
-    });
-    await new Promise(r => setTimeout(r, 1500));
-
-    // 1.5 Pilih filter "Presensi" di dropdown notifikasi
-    if (onProgress) onProgress('🔎 Mengganti filter notifikasi ke "Presensi"...');
-    
-    // Strategi Ganda (Native Select + Visual Klik)
-    await page.evaluate(() => {
-      // A. Coba paksa semua native <select> untuk pindah ke Presensi
-      const selects = Array.from(document.querySelectorAll('select'));
-      for (const s of selects) {
-        for (let i = 0; i < s.options.length; i++) {
-          if (s.options[i].text.toLowerCase().includes('presensi')) {
-            s.selectedIndex = i;
-            s.value = s.options[i].value;
-            s.dispatchEvent(new Event('change', { bubbles: true }));
-            s.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-        }
-      }
-      
-      // B. Coba klik elemen UI (seperti div/span/button) yang bertuliskan "Tugas" / "Semua" 
-      // yang biasanya dipakai sebagai custom dropdown
-      const clickable = Array.from(document.querySelectorAll('div, span, button, a'));
-      for (const el of clickable) {
-        const txt = el.innerText ? el.innerText.trim().toLowerCase() : '';
-        // Jika el menampilkan "tugas" (filter default), coba klik agar list-nya terbuka
-        if (txt === 'tugas' || txt === 'semua pemberitahuan') {
-          el.click();
-        }
-      }
-    });
-
-    await new Promise(r => setTimeout(r, 1000)); // Beri waktu animasi dropdown terbuka (jika itu custom UI)
-
-    await page.evaluate(() => {
-      // C. Temukan dan klik opsi "Presensi" yang muncul di layar
-      const options = Array.from(document.querySelectorAll('div, span, button, a, li, option'));
-      for (const opt of options) {
-        const txt = opt.innerText ? opt.innerText.trim().toLowerCase() : '';
-        if (txt === 'presensi') {
-          opt.click();
-        }
-      }
-    });
-    
-    // Beri waktu jaringan (AJAX) memuat daftar kartu presensi
-    await new Promise(r => setTimeout(r, 2500));
+    await page.waitForSelector('body', { timeout: 15000 });
+    await new Promise(r => setTimeout(r, 2000));
 
     // 2. Logika Berdasarkan Mode
     if (mode === 'scan') {
-      if (onProgress) onProgress('🔎 Memindai daftar absensi yang tersedia...');
+      if (onProgress) onProgress('🔎 Memindai daftar absensi yang tersedia dari "Jadwal Hari Ini"...');
+      
+      // Scroll ke bagian "Jadwal Hari Ini"
+      await page.evaluate(() => {
+        const element = Array.from(document.querySelectorAll('h2, div, p')).find(el => el.innerText && el.innerText.trim() === 'Jadwal Hari Ini');
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else {
+          window.scrollTo(0, document.body.scrollHeight || 1000);
+        }
+      });
+      await new Promise(r => setTimeout(r, 1500));
+
       const availableCourses = await page.evaluate(() => {
-        const listItems = Array.from(document.querySelectorAll('a, li, tr, [class*="item"], div'));
+        const headers = Array.from(document.querySelectorAll('h2, div, p'));
+        const header = headers.find(el => el.innerText && el.innerText.trim() === 'Jadwal Hari Ini');
+        if (!header) return [];
+        
+        const container = header.closest('div[class*="_gradJadwal"]') || header.closest('.rounded-2xl');
+        if (!container) return [];
+        
+        const items = Array.from(container.querySelectorAll('div[class*="_hoverBgFaintWhite"]'));
         const found = [];
-        for (const item of listItems) {
-          const text = item.innerText ? item.innerText.toLowerCase() : '';
-          if (text.includes('dosen telah melakukan presensi')) {
-            const matchIndex = text.indexOf('matakuliah ');
-            let mapel = text;
-            if (matchIndex !== -1) {
-              mapel = text.substring(matchIndex + 'matakuliah '.length).trim();
-              mapel = mapel.split(/\r?\n/)[0].trim();
-            }
-            if (mapel && !found.includes(mapel) && mapel.length < 50) {
-              found.push(mapel);
+        for (const item of items) {
+          const titleEl = item.querySelector('p[class*="truncate"]') || item.querySelector('p.font-semibold') || item.querySelector('p');
+          if (titleEl) {
+            const courseName = titleEl.innerText.trim();
+            if (courseName && !found.includes(courseName)) {
+              found.push(courseName);
             }
           }
         }
@@ -291,10 +252,7 @@ async function loginAndCheckEthol(email, password, onProgress, mode = 'scan', ta
       });
       
       let scanBuffer = null;
-      if (availableCourses.length === 0) {
-        if (onProgress) onProgress('📸 Mengambil bukti layar karena daftar kosong...');
-        scanBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
-      }
+      scanBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
 
       await browser.close();
       return { success: true, mode: 'scan', courses: availableCourses, screenshot: scanBuffer };
@@ -302,100 +260,181 @@ async function loginAndCheckEthol(email, password, onProgress, mode = 'scan', ta
 
     // --- Mode Execute ---
     if (mode === 'execute') {
-      if (onProgress) onProgress(`🗺️ Langkah 1: Mencari notifikasi mapel "${targetCourse || 'Teratas'}"...`);
+      if (onProgress) onProgress(`🗺️ Langkah 1: Mencari jadwal mapel "${targetCourse || 'Teratas'}"...`);
       
-      // Cari div.hover-notifikasi yang tepat berisi teks nama mapel tujuan
-      const foundTarget = await page.evaluate((target) => {
-        // Selector persis sesuai DevTools: div dengan class "hover-notifikasi"
-        const cards = Array.from(document.querySelectorAll('div[class*="hover-notifikasi"]'));
-        for (const card of cards) {
-          const text = card.innerText ? card.innerText.toLowerCase() : '';
-          const matchPresensi = text.includes('dosen telah melakukan presensi');
-          const matchTarget = target ? text.includes(target.toLowerCase()) : true;
-          if (matchPresensi && matchTarget) {
-            card.click();
-            return true;
+      // Scroll ke bagian "Jadwal Hari Ini"
+      await page.evaluate(() => {
+        const element = Array.from(document.querySelectorAll('h2, div, p')).find(el => el.innerText && el.innerText.trim() === 'Jadwal Hari Ini');
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else {
+          window.scrollTo(0, document.body.scrollHeight || 1000);
+        }
+      });
+      await new Promise(r => setTimeout(r, 1500));
+
+      // Klik tombol "Masuk" untuk mata kuliah tujuan
+      const clickResult = await page.evaluate((target) => {
+        const headers = Array.from(document.querySelectorAll('h2, div, p'));
+        const header = headers.find(el => el.innerText && el.innerText.trim() === 'Jadwal Hari Ini');
+        if (!header) return { success: false, error: 'Section "Jadwal Hari Ini" tidak ditemukan' };
+        
+        const container = header.closest('div[class*="_gradJadwal"]') || header.closest('.rounded-2xl');
+        if (!container) return { success: false, error: 'Container jadwal tidak ditemukan' };
+        
+        const items = Array.from(container.querySelectorAll('div[class*="_hoverBgFaintWhite"]'));
+        for (const item of items) {
+          const titleEl = item.querySelector('p[class*="truncate"]') || item.querySelector('p.font-semibold') || item.querySelector('p');
+          if (titleEl && titleEl.innerText.trim().toLowerCase().includes(target.toLowerCase())) {
+            const btn = item.querySelector('button') || item.querySelector('a') || item.querySelector('[class*="btnMasuk"]');
+            if (btn) {
+              btn.click();
+              return { success: true };
+            }
           }
         }
-        return false;
+        return { success: false, error: `Mata kuliah "${target}" tidak ditemukan di jadwal hari ini` };
       }, targetCourse);
 
-      // Tunggu navigasi ke halaman detail notifikasi
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
-      await new Promise(r => setTimeout(r, 1000));
-      
-      // Screenshot setelah navigasi ke halaman detail (harus tampil card + Akses Kuliah)
-      const ss1 = await page.screenshot({ type: 'jpeg', quality: 75 });
-      if (onScreenshot) await onScreenshot(ss1, foundTarget 
-        ? `📸 Langkah 1: Halaman detail notifikasi "${targetCourse}":`
-        : `⚠️ Notifikasi "${targetCourse}" tidak ditemukan — halaman saat ini:`
-      );
-
-      if (!foundTarget) {
-        logs.push(`Gagal menemukan notifikasi untuk: ${targetCourse || 'Teratas'}`);
+      if (!clickResult.success) {
+        throw new Error(clickResult.error);
       }
-    }
 
-    // Langkah 2: Klik "Akses Kuliah" di halaman detail yang sudah terbuka
-    if (onProgress) onProgress('🗺️ Langkah 2: Mengeklik tombol Akses Kuliah...');
-    await page.evaluate(() => {
-      const links = Array.from(document.querySelectorAll('a, button'));
-      for (const link of links) {
-        if (link.innerText && link.innerText.toLowerCase().includes('akses kuliah')) {
-          link.click();
-          break;
+      if (onProgress) onProgress('🗺️ Menunggu halaman detail kelas terbuka...');
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+      await new Promise(r => setTimeout(r, 2000));
+
+      // Setup dialog alert listener
+      let dialogMsg = null;
+      page.on('dialog', async dialog => {
+        dialogMsg = dialog.message();
+        console.log(`[ETHOL] Dialog popped up: ${dialogMsg}`);
+        await dialog.accept();
+      });
+
+      // Periksa status tombol "Presensi"
+      if (onProgress) onProgress('🗺️ Langkah 2: Memeriksa tombol Presensi...');
+      const checkBtn = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button, a'));
+        const btn = buttons.find(el => {
+          const txt = el.innerText ? el.innerText.trim().toLowerCase() : '';
+          return txt === 'presensi' || txt.includes('absen') || txt.includes('hadir');
+        });
+        
+        if (!btn) {
+          return { found: false };
         }
-      }
-    });
-    // Tunggu halaman kelas terbuka
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
-
-    // Screenshot setelah klik Akses Kuliah
-    const ss2 = await page.screenshot({ type: 'jpeg', quality: 75 });
-    if (onScreenshot) await onScreenshot(ss2, `📸 Setelah klik "Akses Kuliah" — halaman kelas:`);
-
-    // 4. Klik tombol Presensi jika belum abu-abu
-    if (onProgress) onProgress('🗺️ Langkah 3: Mencari tombol Presensi...');
-    const clickedBtnText = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button, a'));
-      for (const btn of buttons) {
-        const text = (btn.innerText || '').toLowerCase();
-        if (text === 'presensi' || text.includes('absen') || text.includes('hadir')) {
-          // Abaikan jika "abu-abu" (disabled class or attr)
-          if (!btn.disabled && !btn.className.includes('disabled') && !btn.className.includes('secondary')) {
-            btn.click();
-            return btn.innerText;
+        
+        let isActive = true;
+        if (btn.disabled || btn.getAttribute('disabled') !== null) {
+          isActive = false;
+        } else {
+          const className = btn.className.toLowerCase();
+          if (className.includes('disabled') || className.includes('cursor-not-allowed')) {
+            isActive = false;
+          } else {
+            const style = window.getComputedStyle(btn);
+            if (style.pointerEvents === 'none' || style.opacity === '0.5' || parseFloat(style.opacity) < 0.7) {
+              isActive = false;
+            }
           }
-          return 'CLOSED: ' + btn.innerText;
         }
+        
+        return { found: true, isActive: isActive };
+      });
+
+      let finalStatus = 'NOT_FOUND';
+
+      if (checkBtn.found) {
+        if (checkBtn.isActive) {
+          // Klik tombol presensi
+          if (onProgress) onProgress('🗺️ Langkah 3: Mengeklik tombol Presensi...');
+          await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button, a'));
+            const btn = buttons.find(el => {
+              const txt = el.innerText ? el.innerText.trim().toLowerCase() : '';
+              return txt === 'presensi' || txt.includes('absen') || txt.includes('hadir');
+            });
+            if (btn) btn.click();
+          });
+
+          // Tunggu proses presensi & alert muncul
+          await new Promise(r => setTimeout(r, 4000));
+          finalStatus = 'CLICKED';
+        } else {
+          // Tombol abu-abu, cek tabel History Presensi Saya
+          if (onProgress) onProgress('🗺️ Langkah 3: Tombol Presensi abu-abu. Memeriksa riwayat presensi...');
+          
+          const historyDates = await page.evaluate(() => {
+            const headers = Array.from(document.querySelectorAll('h2, div, p, th'));
+            const historyHeader = headers.find(el => el.innerText && el.innerText.trim().includes('History Presensi Saya'));
+            if (!historyHeader) return [];
+            
+            const container = historyHeader.closest('.card') || historyHeader.closest('div') || historyHeader.parentElement;
+            if (!container) return [];
+            
+            const rows = Array.from(container.querySelectorAll('tr'));
+            const dates = [];
+            if (rows.length > 0) {
+              for (const row of rows) {
+                const cells = Array.from(row.querySelectorAll('td'));
+                if (cells.length > 0) {
+                  const dateText = cells.map(c => c.innerText.trim()).join(' | ');
+                  dates.push(dateText);
+                }
+              }
+            } else {
+              const divs = Array.from(container.querySelectorAll('div, span, p'));
+              for (const div of divs) {
+                if (div.children.length === 0 && div.innerText) {
+                  dates.push(div.innerText.trim());
+                }
+              }
+            }
+            return dates;
+          });
+
+          // Ambil tanggal hari ini dalam format bahasa Indonesia (contoh: 24 Agustus 2026)
+          const now = new Date();
+          const dayNum = now.getDate().toString();
+          const monthsId = [
+            'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+            'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'
+          ];
+          const monthId = monthsId[now.getMonth()];
+          const year = now.getFullYear().toString();
+
+          let hasToday = false;
+          for (const dateText of historyDates) {
+            if (dateText.includes(dayNum) && dateText.toLowerCase().includes(monthId.toLowerCase()) && dateText.includes(year)) {
+              hasToday = true;
+              break;
+            }
+          }
+
+          if (hasToday) {
+            finalStatus = 'ALREADY_DONE';
+          } else {
+            finalStatus = 'CLOSED';
+          }
+        }
+      } else {
+        logs.push('Tombol Presensi tidak ditemukan di halaman detail.');
       }
-      return null;
-    });
 
-    let resultBuffer;
-    if (clickedBtnText && !clickedBtnText.startsWith('CLOSED:')) {
-      if (onProgress) onProgress(`✅ Tombol "${clickedBtnText}" diklik! Menunggu konfirmasi...`);
-      logs.push(`Klik tombol akhir: ${clickedBtnText}`);
-      await new Promise(r => setTimeout(r, 3000));
-      resultBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
-    } else if (clickedBtnText && clickedBtnText.startsWith('CLOSED:')) {
-      if (onProgress) onProgress(`❌ Tombol presensi abu-abu! Absensi sudah ditutup.`);
-      logs.push('Tombol presensi ditemukan tapi sudah ditutup (abu-abu).');
-      resultBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
-    } else {
-      logs.push('Tidak menemukan tombol presensi di halaman akhir.');
-      resultBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
+      // Ambil screenshot final untuk bukti
+      const resultBuffer = await page.screenshot({ type: 'jpeg', quality: 80 });
+      await browser.close();
+
+      return {
+        success: true,
+        mode: 'execute',
+        screenshot: resultBuffer,
+        btnStatus: finalStatus,
+        dialogMessage: dialogMsg,
+        logs: logs
+      };
     }
-
-    await browser.close();
-    
-    return {
-      success: true,
-      mode: 'execute',
-      screenshot: resultBuffer,
-      btnStatus: clickedBtnText,
-      logs: logs
-    };
 
   } catch (error) {
     await browser.close();

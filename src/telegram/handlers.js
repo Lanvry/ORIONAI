@@ -456,10 +456,10 @@ function register(bot) {
            if (result.screenshot) {
              await ctx.replyWithPhoto(
                { source: result.screenshot },
-               { caption: `✅ Pemindaian selesai. *Tidak ada jadwal presensi aktif* yang terdeteksi di dropdown notifikasi. Berikut adalah tangkapan layar lonceng notifikasi Anda.`, parse_mode: 'Markdown' }
+               { caption: `✅ Pemindaian selesai. *Tidak ada jadwal presensi aktif* yang terdeteksi di Jadwal Hari Ini Anda. Berikut adalah tangkapan layar Beranda ETHOL Anda.`, parse_mode: 'Markdown' }
              );
            } else {
-             await ctx.reply(`✅ Pemindaian selesai. *Tidak ada jadwal presensi aktif* yang terdeteksi di notifikasi Anda saat ini.`, { parse_mode: 'Markdown' });
+             await ctx.reply(`✅ Pemindaian selesai. *Tidak ada jadwal presensi aktif* yang terdeteksi di Jadwal Hari Ini Anda.`, { parse_mode: 'Markdown' });
            }
         }
       } catch (err) {
@@ -507,27 +507,30 @@ function register(bot) {
           return await safeEdit(ctx, loadingMsg.message_id, `❌ *Gagal Scraping:* ${result.error}`, { parse_mode: 'Markdown' });
         }
 
-        // Tentukan pesan akhir berdasarkan status tombol
-        const isClosed = result.btnStatus && result.btnStatus.startsWith('CLOSED:');
-        const isClicked = result.btnStatus && !result.btnStatus.startsWith('CLOSED:');
+        const status = result.btnStatus || 'NOT_FOUND';
 
         await ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
         
-        if (isClicked) {
-          await ctx.replyWithPhoto(
-            { source: result.screenshot }, 
-            { caption: `✅ *Absensi Berhasil!*\nBukti kehadiran untuk *${targetCourse}* telah dikonfirmasi.`, parse_mode: 'Markdown' }
-          );
-        } else if (isClosed) {
-          await ctx.replyWithPhoto(
-            { source: result.screenshot }, 
-            { caption: `🔒 *Absensi Sudah Ditutup!*\nTombol presensi untuk *${targetCourse}* berwarna abu-abu. Dosen sudah menutup portal kehadiran.`, parse_mode: 'Markdown' }
-          );
+        const photoSource = result.screenshot ? { source: result.screenshot } : null;
+        const sendMsg = async (captionText) => {
+          if (photoSource) {
+            await ctx.replyWithPhoto(photoSource, { caption: captionText, parse_mode: 'Markdown' });
+          } else {
+            await ctx.reply(captionText, { parse_mode: 'Markdown' });
+          }
+        };
+
+        if (status === 'CLICKED') {
+          const caption = result.dialogMessage
+            ? `✅ *Absensi Berhasil!*\nKonfirmasi: _"${result.dialogMessage}"_\nBukti kehadiran untuk *${targetCourse}* telah dikonfirmasi.`
+            : `✅ *Absensi Berhasil!*\nBukti kehadiran untuk *${targetCourse}* telah dikonfirmasi.`;
+          await sendMsg(caption);
+        } else if (status === 'ALREADY_DONE') {
+          await sendMsg(`✅ *Absensi Sudah Selesai!*\nAnda sudah tercatat hadir untuk mata kuliah *${targetCourse}* hari ini.`);
+        } else if (status === 'CLOSED') {
+          await sendMsg(`🔒 *Absensi Sudah Ditutup!*\nTombol presensi untuk *${targetCourse}* berwarna abu-abu dan tidak ada riwayat presensi hari ini. Dosen sudah menutup portal kehadiran.`);
         } else {
-          await ctx.replyWithPhoto(
-            { source: result.screenshot }, 
-            { caption: `⚠️ *Tombol Presensi Tidak Ditemukan*\nLog: ${result.logs.slice(-2).join(', ')}`, parse_mode: 'Markdown' }
-          );
+          await sendMsg(`⚠️ *Tombol Presensi Tidak Ditemukan*\nLog: ${result.logs.slice(-2).join(', ') || 'Halaman detail kelas berhasil dibuka tetapi tombol presensi tidak terdeteksi.'}`);
         }
 
       } catch (err) {
