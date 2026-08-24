@@ -187,7 +187,8 @@ function isChannelActive(channelId) {
     return true;
 }
 
-const STRIPPED_ROLES_FILE = path.join(__dirname, '../data/stripped_roles.json');
+const STRIPPED_ROLES_FILE = path.join(process.cwd(), 'data/stripped_roles.json');
+const SANCTIONS_HISTORY_FILE = path.join(process.cwd(), 'data/sanctions_history.json');
 
 function loadStrippedRoles() {
     if (!fs.existsSync(STRIPPED_ROLES_FILE)) {
@@ -207,6 +208,28 @@ function saveStrippedRoles(data) {
     }
     fs.writeFileSync(STRIPPED_ROLES_FILE, JSON.stringify(data, null, 2), 'utf8');
 }
+
+
+
+function loadSanctionsHistory() {
+    if (!fs.existsSync(SANCTIONS_HISTORY_FILE)) {
+        return {};
+    }
+    try {
+        return JSON.parse(fs.readFileSync(SANCTIONS_HISTORY_FILE, 'utf8'));
+    } catch (e) {
+        return {};
+    }
+}
+
+function saveSanctionsHistory(data) {
+    const dir = path.dirname(SANCTIONS_HISTORY_FILE);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(SANCTIONS_HISTORY_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
 
 // Melacak status dan timeout voice channel per guild
 const voiceGuildStates = new Map();
@@ -889,10 +912,110 @@ function startDiscordBot() {
           const userId = interaction.user.id.toString();
 
       } else if (interaction.isButton()) {
+          if (interaction.customId.startsWith('unmute_yes_')) {
+              const parts = interaction.customId.split('_');
+              const targetUserId = parts[2];
+              const guildId = parts[3];
+
+              if (interaction.user.id !== targetUserId) {
+                  return interaction.reply({ content: '❌ Tombol ini hanya bisa digunakan oleh pengguna yang di-mute.', flags: MessageFlags.Ephemeral });
+              }
+
+              const targetGuild = client.guilds.cache.get(guildId);
+              if (!targetGuild) {
+                  return interaction.update({ content: '❌ Server Discord tidak ditemukan atau bot tidak memiliki akses.', components: [] });
+              }
+
+              const member = await targetGuild.members.fetch(targetUserId).catch(() => null);
+              if (!member || !member.voice.channel) {
+                  return interaction.update({ content: '⚠️ Kamu sudah tidak berada di voice channel server tersebut.', components: [] });
+              }
+
+              try {
+                  await member.voice.setMute(false, 'Di-unmute oleh Orion AI atas permintaan pengguna via DM');
+                  console.log(`[Voice Unmute 🎙️] Berhasil unmute ${member.user.tag} di server ${targetGuild.name}`);
+                  return interaction.update({
+                      content: '✅ **Berhasil!** Suara kamu sudah di-unmute. Selamat mengobrol kembali di voice channel! 🎙️✨',
+                      components: []
+                  });
+              } catch (unmuteErr) {
+                  console.error(`[Voice Unmute ❌] Gagal unmute ${member.user.tag}:`, unmuteErr.message);
+                  return interaction.update({
+                      content: `❌ **Gagal Unmute:** ${unmuteErr.message} (Pastikan bot memiliki ijin *Mute/Unmute Members* di server).`,
+                      components: []
+                  });
+              }
+          }
+
+          if (interaction.customId.startsWith('unmute_no_')) {
+              const parts = interaction.customId.split('_');
+              const targetUserId = parts[2];
+
+              if (interaction.user.id !== targetUserId) {
+                  return interaction.reply({ content: '❌ Tombol ini hanya bisa digunakan oleh pengguna yang di-mute.', flags: MessageFlags.Ephemeral });
+              }
+
+              return interaction.update({
+                  content: 'Sip, tetap di-mute ya! 👍',
+                  components: []
+              });
+          }
+
+          if (interaction.customId.startsWith('undeafen_yes_')) {
+              const parts = interaction.customId.split('_');
+              const targetUserId = parts[2];
+              const guildId = parts[3];
+
+              if (interaction.user.id !== targetUserId) {
+                  return interaction.reply({ content: '❌ Tombol ini hanya bisa digunakan oleh pengguna yang di-deafen.', flags: MessageFlags.Ephemeral });
+              }
+
+              const targetGuild = client.guilds.cache.get(guildId);
+              if (!targetGuild) {
+                  return interaction.update({ content: '❌ Server Discord tidak ditemukan atau bot tidak memiliki akses.', components: [] });
+              }
+
+              const member = await targetGuild.members.fetch(targetUserId).catch(() => null);
+              if (!member || !member.voice.channel) {
+                  return interaction.update({ content: '⚠️ Kamu sudah tidak berada di voice channel server tersebut.', components: [] });
+              }
+
+              try {
+                  await member.voice.setDeaf(false, 'Di-undeafen oleh Orion AI atas permintaan pengguna via DM');
+                  console.log(`[Voice Undeafen 🎧] Berhasil undeafen ${member.user.tag} di server ${targetGuild.name}`);
+                  return interaction.update({
+                      content: '✅ **Berhasil!** Pendengaran kamu sudah di-undeafen. Selamat mendengarkan kembali di voice channel! 🎧✨',
+                      components: []
+                  });
+              } catch (undeafErr) {
+                  console.error(`[Voice Undeafen ❌] Gagal undeafen ${member.user.tag}:`, undeafErr.message);
+                  return interaction.update({
+                      content: `❌ **Gagal Undeafen:** ${undeafErr.message} (Pastikan bot memiliki ijin *Deafen Members* di server).`,
+                      components: []
+                  });
+              }
+          }
+
+          if (interaction.customId.startsWith('undeafen_no_')) {
+              const parts = interaction.customId.split('_');
+              const targetUserId = parts[2];
+
+              if (interaction.user.id !== targetUserId) {
+                  return interaction.reply({ content: '❌ Tombol ini hanya bisa digunakan oleh pengguna yang di-deafen.', flags: MessageFlags.Ephemeral });
+              }
+
+              return interaction.update({
+                  content: 'Sip, tetap di-deafen ya! 👍',
+                  components: []
+              });
+          }
+
+
           if (interaction.customId.startsWith('intent_exec_')) {
               const parts = interaction.customId.split('_');
               const intent = parts[2];
               const originalUserId = parts[3];
+
 
               if (interaction.user.id !== originalUserId) {
                   return interaction.reply({ content: '❌ Ini bukan untukmu! Hanya pengguna yang meminta yang dapat mengklik tombol ini.', flags: MessageFlags.Ephemeral });
@@ -1245,16 +1368,26 @@ function startDiscordBot() {
         const userId = message.author.id.toString();
         let activePersona = isDirectMessage ? DISCORD_DM_PERSONA : DISCORD_BOT_PERSONA;
 
-        if (isQuestionChannel || isFlowchartChannel) {
-            activePersona += '\n\n⚡ KONTEKS LOKASI (CHANNEL PERTANYAAN/AKADEMIK): Pengguna bertanya di channel khusus <#' + QUESTION_CHANNEL_ID + '>. Berikan jawaban yang JELAS, LENGKAP, DAN MEMBANTU.';
-        } else {
-            activePersona += '\n\n⚡ KONTEKS LOKASI (DI LUAR CHANNEL PERTANYAAN): ATURAN KETAT — JAWAB SINGKAT, PADAT, DAN SANTAI (1 sampai 2 kalimat saja, maksimal 3 kalimat pendek). TIDAK PERLU PANJANG-PANJANG, yang penting jelas dan to-the-point!';
+        if (!isDirectMessage) {
+            if (isQuestionChannel || isFlowchartChannel) {
+                activePersona += '\n\n⚡ KONTEKS LOKASI (CHANNEL PERTANYAAN/AKADEMIK): Pengguna bertanya di channel khusus <#' + QUESTION_CHANNEL_ID + '>. Berikan jawaban yang JELAS, LENGKAP, DAN MEMBANTU.';
+            } else {
+                activePersona += '\n\n⚡ KONTEKS LOKASI (DI LUAR CHANNEL PERTANYAAN): ATURAN KETAT — JAWAB SINGKAT, PADAT, DAN SANTAI (1 sampai 2 kalimat saja, maksimal 3 kalimat pendek). TIDAK PERLU PANJANG-PANJANG, yang penting jelas dan to-the-point!';
+            }
         }
+
 
         // --- Pemulihan Role Interaktif (Repentance) ---
         if (isDirectMessage) {
             const strippedData = loadStrippedRoles();
             if (strippedData[userId]) {
+                const sanctionsHistory = loadSanctionsHistory();
+                const userSanctionCount = sanctionsHistory[userId]?.count || 1;
+
+                if (userSanctionCount >= 3) {
+                    return message.reply("🚫 **Pemulihan Otomatis Ditolak!**\n\nMaaf kak, kamu telah terdeteksi melanggar aturan voice channel sebanyak **3 kali atau lebih**.\n\nSistem pemulihan otomatis sudah tidak berlaku. **Silakan minta Admin server secara langsung ya kak!** 🙏");
+                }
+
                 let repentState = userRepentStates.get(userId);
                 if (!repentState) {
                     repentState = { step: 0 };
@@ -1265,12 +1398,12 @@ function startDiscordBot() {
 
                 if (repentState.step === 0) {
                     repentState.step = 1;
-                    return message.reply("Halo kak. Kamu tahu kan kenapa role kamu dicabut? Janji nggak akan mengulangi lagi memindahkan atau memutuskan koneksi voice orang lain secara iseng? 😡");
+                    return message.reply(`Halo kak. Kamu tahu kan kenapa role kamu dicabut? (Pelanggaran ke-${userSanctionCount} dari max 3x)\n\nJanji nggak akan mengulangi lagi memindahkan atau memutuskan koneksi voice orang lain secara iseng? 😡`);
                 } else if (repentState.step === 1) {
                     const isApology = cleanContent.includes('janji') || cleanContent.includes('maaf') || cleanContent.includes('ya') || cleanContent.includes('iya') || cleanContent.includes('nggak');
                     if (isApology) {
                         repentState.step = 2;
-                        return message.reply("Beneran nih? Kalau diulangi lagi, role kamu dicabut permanen ya. Ketik secara persis kalimat ini jika kamu setuju:\n\n`Saya berjanji tidak akan mengulangi lagi`");
+                        return message.reply(`Beneran nih? (Ini kesempatan ke-${userSanctionCount} dari max 3x). Kalau melanggar sampai 3 kali, pemulihan otomatis akan dikunci permanen.\n\nKetik secara persis kalimat ini jika kamu setuju:\n\n\`Saya berjanji tidak akan mengulangi lagi\``);
                     } else {
                         return message.reply("Jawaban kamu kurang meyakinkan. Kamu janji atau nggak buat berhenti iseng di voice channel? Jawab 'janji' atau 'maaf' dulu!");
                     }
@@ -1300,6 +1433,7 @@ function startDiscordBot() {
                         return message.reply("Kalimat janji kamu salah/tidak persis. Silakan ketik kalimat ini dengan tepat:\n\n`Saya berjanji tidak akan mengulangi lagi`");
                     }
                 }
+                return;
             }
         }
     if (hasPrefix) {
@@ -1425,6 +1559,130 @@ function startDiscordBot() {
               if (guild.name && (guild.name.toLowerCase().includes('teknik informatika') || guild.name.toLowerCase().includes('tester'))) {
                   const wasMoved = oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId;
                   const wasDisconnected = oldState.channelId && !newState.channelId;
+                  const wasServerMuted = !oldState.serverMute && newState.serverMute;
+                  const wasServerDeafened = !oldState.serverDeaf && newState.serverDeaf;
+
+                  if (wasServerMuted) {
+                      const targetUser = newState.member?.user || oldState.member?.user;
+                      const targetId = newState.member?.id || oldState.member?.id || newState.id || oldState.id;
+
+                      console.log(`[Voice Moderation 🤫] Deteksi SERVER MUTE pada user: ${targetUser?.tag || targetId} di server "${guild.name}"`);
+
+                      // Tunggu 1.2s agar audit log Discord ter-update
+                      await new Promise(r => setTimeout(r, 1200));
+
+                      let auditLogs = null;
+                      try {
+                          auditLogs = await guild.fetchAuditLogs({
+                              limit: 10,
+                              type: AuditLogEvent.MemberUpdate
+                          });
+                      } catch (auditErr) {
+                          console.warn(`[Voice Moderation ⚠️] Gagal membaca Audit Log untuk Server Mute: ${auditErr.message}`);
+                      }
+
+                      let executorMention = 'seseorang (admin)';
+
+                      if (auditLogs && auditLogs.entries) {
+                          const now = Date.now();
+                          const logEntry = auditLogs.entries.find(entry => {
+                              const ageMs = Math.abs(now - entry.createdTimestamp);
+                              const executorId = entry.executor?.id;
+                              return ageMs < 30000 && executorId && executorId !== targetId && !entry.executor.bot;
+                          });
+
+                          if (logEntry && logEntry.executor) {
+                              executorMention = `<@${logEntry.executor.id}> (${logEntry.executor.tag})`;
+                          }
+                      }
+
+                      if (targetUser) {
+                          const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+                          const row = new ActionRowBuilder().addComponents(
+                              new ButtonBuilder()
+                                  .setCustomId(`unmute_yes_${targetId}_${guild.id}`)
+                                  .setLabel('🔊 Ya, Unmute Saya!')
+                                  .setStyle(ButtonStyle.Success),
+                              new ButtonBuilder()
+                                  .setCustomId(`unmute_no_${targetId}`)
+                                  .setLabel('❌ Tidak usah')
+                                  .setStyle(ButtonStyle.Secondary)
+                          );
+
+                          const muteNoticeMsg = `📢 **Pemberitahuan Voice Channel**\n\nKamu baru saja **di-mute oleh server** oleh ${executorMention} di server **${guild.name}**.\n\nApakah kamu mau aku **unmute** sekarang?`;
+
+                          await targetUser.send({
+                              content: muteNoticeMsg,
+                              components: [row]
+                          }).then(() => {
+                              console.log(`[Voice Server Mute 📩] DM Penawaran Unmute berhasil dikirim ke ${targetUser.tag}`);
+                          }).catch(err => {
+                              console.warn(`[Voice Server Mute ⚠️] Gagal mengirim DM ke ${targetUser.tag}:`, err.message);
+                          });
+                      }
+                  }
+
+                  if (wasServerDeafened) {
+                      const targetUser = newState.member?.user || oldState.member?.user;
+                      const targetId = newState.member?.id || oldState.member?.id || newState.id || oldState.id;
+
+                      console.log(`[Voice Moderation 🎧] Deteksi SERVER DEAFEN pada user: ${targetUser?.tag || targetId} di server "${guild.name}"`);
+
+                      // Tunggu 1.2s agar audit log Discord ter-update
+                      await new Promise(r => setTimeout(r, 1200));
+
+                      let auditLogs = null;
+                      try {
+                          auditLogs = await guild.fetchAuditLogs({
+                              limit: 10,
+                              type: AuditLogEvent.MemberUpdate
+                          });
+                      } catch (auditErr) {
+                          console.warn(`[Voice Moderation ⚠️] Gagal membaca Audit Log untuk Server Deafen: ${auditErr.message}`);
+                      }
+
+                      let executorMention = 'seseorang (admin)';
+
+                      if (auditLogs && auditLogs.entries) {
+                          const now = Date.now();
+                          const logEntry = auditLogs.entries.find(entry => {
+                              const ageMs = Math.abs(now - entry.createdTimestamp);
+                              const executorId = entry.executor?.id;
+                              return ageMs < 30000 && executorId && executorId !== targetId && !entry.executor.bot;
+                          });
+
+                          if (logEntry && logEntry.executor) {
+                              executorMention = `<@${logEntry.executor.id}> (${logEntry.executor.tag})`;
+                          }
+                      }
+
+                      if (targetUser) {
+                          const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+                          const row = new ActionRowBuilder().addComponents(
+                              new ButtonBuilder()
+                                  .setCustomId(`undeafen_yes_${targetId}_${guild.id}`)
+                                  .setLabel('🎧 Ya, Undeafen Saya!')
+                                  .setStyle(ButtonStyle.Success),
+                              new ButtonBuilder()
+                                  .setCustomId(`undeafen_no_${targetId}`)
+                                  .setLabel('❌ Tidak usah')
+                                  .setStyle(ButtonStyle.Secondary)
+                          );
+
+                          const deafNoticeMsg = `📢 **Pemberitahuan Voice Channel**\n\nKamu baru saja **di-deafen oleh server** oleh ${executorMention} di server **${guild.name}**.\n\nApakah kamu mau aku **undeafen** sekarang?`;
+
+                          await targetUser.send({
+                              content: deafNoticeMsg,
+                              components: [row]
+                          }).then(() => {
+                              console.log(`[Voice Server Deafen 📩] DM Penawaran Undeafen berhasil dikirim ke ${targetUser.tag}`);
+                          }).catch(err => {
+                              console.warn(`[Voice Server Deafen ⚠️] Gagal mengirim DM ke ${targetUser.tag}:`, err.message);
+                          });
+                      }
+                  }
+
+
 
                   if (wasMoved || wasDisconnected) {
                       const targetUser = newState.member?.user || oldState.member?.user;
@@ -1467,7 +1725,6 @@ function startDiscordBot() {
 
                           if (logEntry) {
                               const executor = logEntry.executor;
-                              // Pelaku ditemukan! Lacak aktivitas pelaku
                               const userId = executor.id;
 
                               if (!voiceTrollTracker.has(userId)) {
@@ -1489,11 +1746,32 @@ function startDiscordBot() {
 
                               if (trollData.count === 3 && !trollData.warned) {
                                   trollData.warned = true;
-                                  const warningMsg = `⚠️ **Peringatan!** Kamu terdeteksi memindahkan/disconnect user lain di voice channel sebanyak 3 kali dalam waktu singkat.\n\nJika tindakan ini dilanjutkan, seluruh role kamu akan **dicabut otomatis**! 😡\n\n*Pesan ini hanya bisa kamu lihat (DM pribadi).*`;
-                                  await executor.send(warningMsg).catch(() => {});
-                                  console.log(`[Voice Anti-Troll ⚠️] DM Peringatan dikirim ke ${executor.tag}`);
+
+                                  const member = await guild.members.fetch(userId).catch(() => null);
+                                  const botMember = guild.members.me || await guild.members.fetch(client.user.id);
+                                  const botHighestRole = botMember ? botMember.roles.highest : null;
+
+                                  let hasStrippableRoles = false;
+                                  if (member && botHighestRole) {
+                                      for (const [roleId, role] of member.roles.cache) {
+                                          if (roleId === guild.id) continue; // Skip @everyone
+                                          if (role.position < botHighestRole.position) {
+                                              hasStrippableRoles = true;
+                                              break;
+                                          }
+                                      }
+                                  }
+
+                                  if (hasStrippableRoles) {
+                                      const warningMsg = `⚠️ **Peringatan!** Kamu terdeteksi memindahkan/disconnect user lain di voice channel sebanyak 3 kali dalam waktu singkat.\n\nJika tindakan ini dilanjutkan, seluruh role kamu akan **dicabut otomatis**! 😡\n\n*Pesan ini hanya bisa kamu lihat (DM pribadi).*`;
+                                      await executor.send(warningMsg).catch(() => {});
+                                      console.log(`[Voice Anti-Troll ⚠️] DM Peringatan dikirim ke ${executor.tag}`);
+                                  } else {
+                                      console.log(`[Voice Anti-Troll 👑] Peringatan pencabutan role ke-3 dilewati untuk ${executor.tag} karena ber-role lebih tinggi dari bot.`);
+                                  }
                               } else if (trollData.count >= 4) {
-                                  // Cabut role!
+
+                                  // Sanksi ke-4!
                                   const member = await guild.members.fetch(userId).catch(() => null);
                                   if (member) {
                                       const botMember = guild.members.me || await guild.members.fetch(client.user.id);
@@ -1511,25 +1789,58 @@ function startDiscordBot() {
 
                                       if (rolesToStrip.length > 0) {
                                           const allStripped = loadStrippedRoles();
-                                          allStripped[userId] = {
-                                              guildId: guild.id,
-                                              roles: rolesToStrip,
-                                              timestamp: new Date().toISOString()
-                                          };
-                                          saveStrippedRoles(allStripped);
+                                           allStripped[userId] = {
+                                               guildId: guild.id,
+                                               roles: rolesToStrip,
+                                               timestamp: new Date().toISOString()
+                                           };
+                                           saveStrippedRoles(allStripped);
 
-                                          await member.roles.remove(rolesToStrip, 'Melanggar aturan memindahkan/disconnect voice channel berkali-kali').catch(e => {
-                                              console.error(`[Voice Anti-Troll ❌] Gagal mencabut beberapa role:`, e.message);
-                                          });
+                                           // Simpan riwayat sanksi akumulatif
+                                           const sanctionsHistory = loadSanctionsHistory();
+                                           const currentSanctionCount = (sanctionsHistory[userId]?.count || 0) + 1;
+                                           sanctionsHistory[userId] = {
+                                               count: currentSanctionCount,
+                                               lastSanction: new Date().toISOString()
+                                           };
+                                           saveSanctionsHistory(sanctionsHistory);
 
-                                          const penaltyMsg = `🚫 **Role Dicabut!** Kamu telah melanggar peringatan sebelumnya dengan memindahkan/disconnect user lain sebanyak **${trollData.count} kali**.\n\nSeluruh role kamu telah **dicabut otomatis** sebagai sanksi.\n\n*Chat bot ini via DM jika ingin mengajukan pemulihan role.*`;
-                                          await member.send(penaltyMsg).catch(() => {});
+                                           await member.roles.remove(rolesToStrip, 'Melanggar aturan memindahkan/disconnect voice channel berkali-kali').catch(e => {
+                                               console.error(`[Voice Anti-Troll ❌] Gagal mencabut beberapa role:`, e.message);
+                                           });
 
-                                          console.log(`[Voice Anti-Troll 🚫] Role ${rolesToStrip.length} dicabut dari ${executor.tag} — total aksi: ${trollData.count}`);
+                                           let penaltyMsg = '';
+                                           if (currentSanctionCount >= 3) {
+                                               penaltyMsg = `🚫 **Role Dicabut (Sanksi Ke-${currentSanctionCount})!**\n\nKamu telah melanggar aturan memindahkan/disconnect user lain sebanyak **${trollData.count} kali**.\n\nSeluruh role kamu telah **dicabut otomatis**.\n\n⚠️ *Karena kamu sudah melanggar sebanyak 3 kali atau lebih, pemulihan otomatis TIDAK LAGI BERLAKU. Silakan minta Admin server secara langsung ya kak! 🙏*`;
+                                           } else {
+                                               penaltyMsg = `🚫 **Role Dicabut (Sanksi Ke-${currentSanctionCount} dari max 3x)!**\n\nKamu telah melanggar aturan memindahkan/disconnect user lain sebanyak **${trollData.count} kali**.\n\nSeluruh role kamu telah **dicabut otomatis**.\n\n*Chat bot ini via DM jika ingin mengajukan pemulihan role.*`;
+                                           }
+                                           await member.send(penaltyMsg).catch(() => {});
+
+                                          console.log(`[Voice Anti-Troll 🚫] Role ${rolesToStrip.length} dicabut dari ${executor.tag} (Sanksi ke-${currentSanctionCount})`);
                                       } else {
-                                          console.log(`[Voice Anti-Troll] ${executor.tag} tidak memiliki role di bawah bot yang bisa dicabut.`);
+                                          console.log(`[Voice Anti-Troll 👑] ${executor.tag} ber-role tinggi/di atas bot. Mengirim teguran AI via DM...`);
+                                          try {
+                                              const aiPrompt = `Buatkan pesan DM santai tapi menegur untuk seorang admin/user ber-role tinggi bernama "${executor.username}" yang baru saja memindahkan atau me-disconnect anggota lain di voice channel berkali-kali secara iseng. Gunakan ungkapan kasual seperti "bang jangan rusuh bang", ingatkan kasihan member lain yang dipindah-pindah, gaya bahasa gaul PENS SUMENEP tapi tetap sopan. Maksimal 2-3 kalimat.`;
+                                              const aiWarnMsg = await askAI(userId, aiPrompt, [], [], null, DISCORD_DM_PERSONA);
+                                              if (aiWarnMsg && aiWarnMsg.trim() !== '[IGNORE]') {
+                                                  await executor.send(aiWarnMsg).catch(() => {});
+                                              }
+                                          } catch (aiErr) {
+                                              const fallbackWarn = `Bang ${executor.username}, jangan rusuh bang wkwk 😅 Kasihan member lain dipindah-pindah/disconnect terus di voice channel. Santai aja ya bang! 🙏`;
+                                              await executor.send(fallbackWarn).catch(() => {});
+                                          }
+                                      }
+
+                                      // Kirim notifikasi DM ke korban (targetUser) HANYA setelah pelaku terkena sanksi (counter ke-4)
+                                      if (targetUser && targetUser.id !== executor.id) {
+                                          const actionStr = wasMoved ? 'dipindahkan' : 'dikeluarkan (disconnected)';
+                                          const victimMsg = `📢 **Pemberitahuan Voice Channel**\n\nHai! Kamu baru saja **${actionStr}** dari voice channel oleh <@${executor.id}> (**${executor.tag}**). Pelaku telah diberikan sanksi/teguran oleh bot! 🛡️`;
+                                          await targetUser.send(victimMsg).catch(() => {});
+                                          console.log(`[Voice Anti-Troll 📩] DM Pemberitahuan dikirim ke korban ${targetUser.tag}`);
                                       }
                                   }
+
                                   trollData.count = 0;
                                   trollData.warned = false;
                               }
